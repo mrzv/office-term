@@ -1,6 +1,7 @@
 pub mod app;
 pub mod browser;
 pub mod config;
+pub(crate) mod excel;
 pub mod ipc;
 pub mod kitty;
 pub mod pptx;
@@ -9,3 +10,4 @@ pub mod recent;
 pub mod screenshot;
 pub mod terminal;
 pub mod theme;
+pub(crate) mod word;

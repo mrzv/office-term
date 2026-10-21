@@ -187,7 +187,7 @@ pub fn save(
     })?;
     let temp = loop {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".pptxterm-shot-{}-{id}.tmp", std::process::id()));
+        let candidate = parent.join(format!(".officeterm-shot-{}-{id}.tmp", std::process::id()));
         match OpenOptions::new()
             .write(true)
             .create_new(true)

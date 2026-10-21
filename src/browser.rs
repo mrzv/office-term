@@ -511,11 +511,36 @@ fn collect_presentation_files_recursive(
 }
 
 fn is_presentation(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case("pptx")
-            || extension.eq_ignore_ascii_case("ppsx")
-            || extension.eq_ignore_ascii_case("potx")
-    })
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "pptx"
+            | "ppsx"
+            | "potx"
+            | "pptm"
+            | "ppsm"
+            | "potm"
+            | "docx"
+            | "docm"
+            | "dotx"
+            | "dotm"
+            | "doc"
+            | "dot"
+            | "rtf"
+            | "odt"
+            | "xlsx"
+            | "xlsm"
+            | "xltx"
+            | "xltm"
+            | "xls"
+            | "xlt"
+            | "xlsb"
+            | "ods"
+            | "csv"
+            | "tsv"
+    )
 }
 
 #[cfg(test)]

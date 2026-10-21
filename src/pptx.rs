@@ -328,14 +328,15 @@ pub struct PptxWorker {
     handle: Option<JoinHandle<()>>,
 }
 
-/// Initializes the global `deckcraft-fonts` database before any background threads are spawned.
+/// Initializes the global `deckcraft-fonts` and `wordcraft-fonts` databases before any background
+/// threads are spawned.
 ///
-/// On macOS, `deckcraft_fonts::system_font_dirs()` includes
+/// On macOS, `system_font_dirs()` includes
 /// `$HOME/Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts`. Reading inside
 /// `~/Library/Group Containers` from a terminal triggers a macOS TCC prompt (`"kitty" would like
 /// to access data from other apps`). To avoid touching Microsoft Office's group container while
-/// still keeping user-installed fonts (`~/Library/Fonts`) and giving `pptxterm` its own font
-/// cache (`~/.cache/pptxterm/fonts`), we point `HOME` at a synthetic `<cache>/pptxterm/font-home`
+/// still keeping user-installed fonts (`~/Library/Fonts`) and giving `officeterm` its own font
+/// cache (`~/.cache/officeterm/fonts`), we point `HOME` at a synthetic `<cache>/officeterm/font-home`
 /// directory while `FontDb::global()` records its search paths, then immediately restore `HOME`.
 pub fn init_font_db() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -366,10 +367,12 @@ pub fn init_font_db() {
                     std::env::set_var("HOME", &font_home);
                 }
                 let _ = FontDb::global();
+                let _ = wordcraft_fonts::FontDb::global();
                 return;
             }
         }
         let _ = FontDb::global();
+        let _ = wordcraft_fonts::FontDb::global();
     });
 }
 
@@ -396,7 +399,7 @@ fn ensure_symlink(target: &Path, link: &Path) -> io::Result<()> {
 
 #[cfg(any(target_os = "macos", test))]
 fn prepare_macos_font_home(home: &Path, cache_base: &Path) -> io::Result<PathBuf> {
-    let app_cache = cache_base.join("pptxterm");
+    let app_cache = cache_base.join("officeterm");
     let font_cache = app_cache.join("fonts");
     std::fs::create_dir_all(&font_cache)?;
 
@@ -550,8 +553,14 @@ impl Drop for PptxWorker {
     }
 }
 
+enum DocumentBackend {
+    Pptx(Box<Presentation>),
+    Word(Box<crate::word::WordDocument>),
+    Excel(Box<crate::excel::ExcelDocument>),
+}
+
 struct OpenPresentation {
-    presentation: Presentation,
+    backend: DocumentBackend,
     revision: DocumentRevision,
     pages: u32,
     text_cache: Vec<Option<CachedSlideText>>,
@@ -560,11 +569,25 @@ struct OpenPresentation {
 }
 
 #[derive(Clone)]
-struct CachedSlideText {
+pub(crate) struct CachedSlideText {
+    pub(crate) raw: String,
+    pub(crate) normalized: String,
+    pub(crate) source_index_by_byte: Vec<usize>,
+    pub(crate) char_rects: Vec<Option<ModelRect>>,
+}
+
+pub(crate) fn build_cached_text(
     raw: String,
-    normalized: String,
-    source_index_by_byte: Vec<usize>,
     char_rects: Vec<Option<ModelRect>>,
+) -> CachedSlideText {
+    let (normalized, source_index_by_byte) =
+        normalize_search_characters(raw.chars().enumerate());
+    CachedSlideText {
+        raw,
+        normalized,
+        source_index_by_byte,
+        char_rects,
+    }
 }
 
 #[derive(Clone)]
@@ -683,25 +706,21 @@ impl PendingCommands {
     }
 }
 
-fn load_presentation(path: &Path) -> Result<(Presentation, DocumentRevision), String> {
-    let revision = DocumentRevision::read(path)
-        .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    if deckcraft_pptx::is_encrypted(&bytes) {
+fn load_presentation_from_bytes(path: &Path, bytes: &[u8]) -> Result<Presentation, String> {
+    if deckcraft_pptx::is_encrypted(bytes) {
         return Err(format!(
             "{} is password-protected / encrypted",
             path.display()
         ));
     }
-    let mut presentation = deckcraft_pptx::import(&bytes)
+    let mut presentation = deckcraft_pptx::import(bytes)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     deckcraft_format::repair(&mut presentation);
     install_embedded_fonts(&presentation);
     if presentation.slides.is_empty() {
         return Err(format!("{} has no slides", path.display()));
     }
-    Ok((presentation, revision))
+    Ok(presentation)
 }
 
 fn install_embedded_fonts(presentation: &Presentation) {
@@ -720,12 +739,36 @@ fn install_embedded_fonts(presentation: &Presentation) {
 fn open_presentation(
     path: &Path,
 ) -> Result<(OpenPresentation, u32, Vec<OutlineItem>, DocumentRevision), String> {
-    let (presentation, revision) = load_presentation(path)?;
-    let pages = u32::try_from(presentation.slides.len())
-        .map_err(|_| "presentation has too many slides".to_string())?;
-    let outline = collect_outline(&presentation);
+    let revision = DocumentRevision::read(path)
+        .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let (backend, pages, outline) = match ext.as_str() {
+        "docx" | "doc" | "docm" | "dotx" | "dotm" | "dot" | "rtf" | "odt" => {
+            let (word, pages, outline) = crate::word::WordDocument::load(path, &bytes, &ext)?;
+            (DocumentBackend::Word(Box::new(word)), pages, outline)
+        }
+        "xlsx" | "xls" | "xlsm" | "xlsb" | "xltx" | "xltm" | "xlt" | "ods" | "csv" | "tsv" => {
+            let (excel, pages, outline) = crate::excel::ExcelDocument::load(path, &bytes)?;
+            (DocumentBackend::Excel(Box::new(excel)), pages, outline)
+        }
+        _ => {
+            let presentation = load_presentation_from_bytes(path, &bytes)?;
+            let pages = u32::try_from(presentation.slides.len())
+                .map_err(|_| "presentation has too many slides".to_string())?;
+            let outline = collect_outline(&presentation);
+            (DocumentBackend::Pptx(Box::new(presentation)), pages, outline)
+        }
+    };
+
     let doc = OpenPresentation {
-        presentation,
+        backend,
         revision,
         pages,
         text_cache: (0..pages).map(|_| None).collect(),
@@ -795,7 +838,7 @@ fn slide_title(slide: &deckcraft_model::Slide, index: usize) -> String {
     format!("Slide {}", index + 1)
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
@@ -1007,12 +1050,25 @@ fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Opt
     let Ok(slide_index) = usize::try_from(key.page) else {
         return Ok(None);
     };
-    if slide_index >= doc.presentation.slides.len() {
+    let page_count = match &doc.backend {
+        DocumentBackend::Pptx(pres) => pres.slides.len(),
+        DocumentBackend::Word(word) => word.page_count(),
+        DocumentBackend::Excel(excel) => excel.page_count(),
+    };
+    if slide_index >= page_count {
         return Ok(None);
     }
 
-    let page_width_pt = doc.presentation.slide_size.width.max(1.0) as f32;
-    let page_height_pt = doc.presentation.slide_size.height.max(1.0) as f32;
+    let (page_w_f64, page_h_f64) = match &doc.backend {
+        DocumentBackend::Pptx(pres) => (
+            pres.slide_size.width.max(1.0),
+            pres.slide_size.height.max(1.0),
+        ),
+        DocumentBackend::Word(word) => word.page_size(slide_index),
+        DocumentBackend::Excel(excel) => excel.page_size(slide_index),
+    };
+    let page_width_pt = page_w_f64 as f32;
+    let page_height_pt = page_h_f64 as f32;
     let content_bounds = slide_content_bounds(doc, key.page);
 
     let zoom = u32::from(key.zoom.max(1));
@@ -1028,35 +1084,60 @@ fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Opt
     let (width, height) = clamp_to_max_side(width, height);
 
     let render_started = Instant::now();
-    let image = render_slide(
-        &doc.presentation,
-        slide_index,
-        &RenderOpts {
-            scale: (f64::from(width) / doc.presentation.slide_size.width.max(1.0))
-                .min(f64::from(height) / doc.presentation.slide_size.height.max(1.0)),
-            size: Some((width, height)),
-            ..Default::default()
-        },
-    );
-    let width = image.width.max(1);
-    let height = image.height.max(1);
-    let scale = (f64::from(width) / doc.presentation.slide_size.width.max(1.0))
-        .min(f64::from(height) / doc.presentation.slide_size.height.max(1.0));
-    let mut rgba = image.to_straight();
+    let (width, height, scale, mut rgba, mask, links) = match &doc.backend {
+        DocumentBackend::Pptx(pres) => {
+            let image = render_slide(
+                pres,
+                slide_index,
+                &RenderOpts {
+                    scale: (f64::from(width) / page_w_f64).min(f64::from(height) / page_h_f64),
+                    size: Some((width, height)),
+                    ..Default::default()
+                },
+            );
+            let width = image.width.max(1);
+            let height = image.height.max(1);
+            let scale = (f64::from(width) / page_w_f64).min(f64::from(height) / page_h_f64);
+            let rgba = image.to_straight();
+            let placed = place_slide(pres, slide_index);
+            let mask = if key.invert {
+                raster_picture_mask(pres, slide_index, width, height, scale)
+            } else {
+                None
+            };
+            let links = extract_slide_links(pres, slide_index, &placed, width, height, scale);
+            (width, height, scale, rgba, mask, links)
+        }
+        DocumentBackend::Word(word) => {
+            let (w, h, s, rgba) = word.render_page_rgba(slide_index, width, height);
+            let mask = if key.invert {
+                word.picture_mask(slide_index, w, h, s)
+            } else {
+                None
+            };
+            let links = word.extract_page_links(slide_index, w, h, s);
+            (w, h, s, rgba, mask, links)
+        }
+        DocumentBackend::Excel(excel) => {
+            let (w, h, s, rgba) = excel.render_page_rgba(slide_index, width, height);
+            let mask = if key.invert {
+                excel.picture_mask(slide_index, w, h, s)
+            } else {
+                None
+            };
+            let links = excel.extract_page_links(slide_index, w, h, s);
+            (w, h, s, rgba, mask, links)
+        }
+    };
     let render_elapsed = render_started.elapsed();
-
-    let placed = place_slide(&doc.presentation, slide_index);
 
     let dark_mode_elapsed = if key.invert {
         let dark_started = Instant::now();
-        let mask = raster_picture_mask(&doc.presentation, slide_index, width, height, scale);
         darken_rgba(&mut rgba, mask.as_deref(), key.dark_mode_style);
         Some(dark_started.elapsed())
     } else {
         None
     };
-
-    let links = extract_slide_links(&doc.presentation, slide_index, &placed, width, height, scale);
 
     let highlight_started = Instant::now();
     let mut highlighted = false;
@@ -1125,56 +1206,61 @@ fn slide_content_bounds(doc: &mut OpenPresentation, page: u32) -> [f32; 4] {
     if let Some(&bounds) = doc.content_bounds_cache.get(&page) {
         return bounds;
     }
-    let slide_w = doc.presentation.slide_size.width.max(1.0) as f32;
-    let slide_h = doc.presentation.slide_size.height.max(1.0) as f32;
     let full = [0.0, 0.0, 1.0, 1.0];
     let Ok(slide_index) = usize::try_from(page) else {
         return full;
     };
-    if slide_index >= doc.presentation.slides.len() {
-        return full;
-    }
+    let bounds = match &doc.backend {
+        DocumentBackend::Pptx(pres) => {
+            if slide_index >= pres.slides.len() {
+                return full;
+            }
+            let slide_w = pres.slide_size.width.max(1.0) as f32;
+            let slide_h = pres.slide_size.height.max(1.0) as f32;
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
 
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
+            visit_slide_shapes(pres, slide_index, |shape, rect| {
+                if !matches!(shape.kind, ShapeKind::Group { .. }) {
+                    include_rect_bounds(
+                        rect,
+                        &mut min_x,
+                        &mut min_y,
+                        &mut max_x,
+                        &mut max_y,
+                        slide_w,
+                        slide_h,
+                    );
+                }
+            });
 
-    visit_slide_shapes(&doc.presentation, slide_index, |shape, rect| {
-        if !matches!(shape.kind, ShapeKind::Group { .. }) {
-            include_rect_bounds(
-                rect,
-                &mut min_x,
-                &mut min_y,
-                &mut max_x,
-                &mut max_y,
-                slide_w,
-                slide_h,
-            );
+            if min_x.is_finite()
+                && min_y.is_finite()
+                && max_x > min_x + 1.0
+                && max_y > min_y + 1.0
+            {
+                let pad_x = (slide_w * 0.02).max(4.0);
+                let pad_y = (slide_h * 0.02).max(4.0);
+                [
+                    ((min_x - pad_x).clamp(0.0, slide_w) / slide_w).clamp(0.0, 1.0),
+                    ((min_y - pad_y).clamp(0.0, slide_h) / slide_h).clamp(0.0, 1.0),
+                    ((max_x + pad_x).clamp(0.0, slide_w) / slide_w).clamp(0.0, 1.0),
+                    ((max_y + pad_y).clamp(0.0, slide_h) / slide_h).clamp(0.0, 1.0),
+                ]
+            } else {
+                full
+            }
         }
-    });
-
-    let bounds = if min_x.is_finite()
-        && min_y.is_finite()
-        && max_x > min_x + 1.0
-        && max_y > min_y + 1.0
-    {
-        let pad_x = (slide_w * 0.02).max(4.0);
-        let pad_y = (slide_h * 0.02).max(4.0);
-        [
-            ((min_x - pad_x).clamp(0.0, slide_w) / slide_w).clamp(0.0, 1.0),
-            ((min_y - pad_y).clamp(0.0, slide_h) / slide_h).clamp(0.0, 1.0),
-            ((max_x + pad_x).clamp(0.0, slide_w) / slide_w).clamp(0.0, 1.0),
-            ((max_y + pad_y).clamp(0.0, slide_h) / slide_h).clamp(0.0, 1.0),
-        ]
-    } else {
-        full
+        DocumentBackend::Word(word) => word.content_bounds(slide_index),
+        DocumentBackend::Excel(excel) => excel.content_bounds(slide_index),
     };
     doc.content_bounds_cache.insert(page, bounds);
     bounds
 }
 
-fn include_rect_bounds(
+pub(crate) fn include_rect_bounds(
     r: KurboRect,
     min_x: &mut f32,
     min_y: &mut f32,
@@ -1279,6 +1365,15 @@ fn raster_picture_mask(
             rects.push(rect);
         }
     });
+    raster_mask_from_rects(&rects, width, height, scale)
+}
+
+pub(crate) fn raster_mask_from_rects(
+    rects: &[KurboRect],
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> Option<Vec<u8>> {
     if rects.is_empty() {
         return None;
     }
@@ -1553,9 +1648,9 @@ fn resolve_hyperlink(
     }
 }
 
-fn default_link_label(target: &LinkTarget) -> String {
+pub(crate) fn default_link_label(target: &LinkTarget) -> String {
     match target {
-        LinkTarget::Internal { page, .. } => format!("Slide {}", page + 1),
+        LinkTarget::Internal { page, .. } => format!("Page {}", page + 1),
         LinkTarget::Uri(uri) => uri.clone(),
     }
 }
@@ -1579,7 +1674,7 @@ fn placed_text_span_bbox(
     union
 }
 
-fn transform_rect_bbox(affine: &kurbo::Affine, rect: KurboRect) -> KurboRect {
+pub(crate) fn transform_rect_bbox(affine: &kurbo::Affine, rect: KurboRect) -> KurboRect {
     let p0 = *affine * KurboPoint::new(rect.x0, rect.y0);
     let p1 = *affine * KurboPoint::new(rect.x1, rect.y0);
     let p2 = *affine * KurboPoint::new(rect.x1, rect.y1);
@@ -1591,7 +1686,7 @@ fn transform_rect_bbox(affine: &kurbo::Affine, rect: KurboRect) -> KurboRect {
     KurboRect::new(min_x, min_y, max_x, max_y)
 }
 
-fn bbox_to_page_link_rect(
+pub(crate) fn bbox_to_page_link_rect(
     bbox: KurboRect,
     width: u32,
     height: u32,
@@ -1626,23 +1721,50 @@ fn index_slide_links(doc: &mut OpenPresentation, page: u32) -> Vec<DocumentLink>
     let Ok(slide_index) = usize::try_from(page) else {
         return Vec::new();
     };
-    if slide_index >= doc.presentation.slides.len() {
-        return Vec::new();
-    }
-    let slide_w = doc.presentation.slide_size.width.max(1.0);
-    let slide_h = doc.presentation.slide_size.height.max(1.0);
-    let index_width = 1000u32;
-    let index_height = ((f64::from(index_width) * slide_h / slide_w).round() as u32).max(1);
-    let scale = f64::from(index_width) / slide_w;
-    let placed = place_slide(&doc.presentation, slide_index);
-    let links = extract_slide_links(
-        &doc.presentation,
-        slide_index,
-        &placed,
-        index_width,
-        index_height,
-        scale,
-    );
+    let (index_height, links) = match &doc.backend {
+        DocumentBackend::Pptx(pres) => {
+            if slide_index >= pres.slides.len() {
+                return Vec::new();
+            }
+            let slide_w = pres.slide_size.width.max(1.0);
+            let slide_h = pres.slide_size.height.max(1.0);
+            let index_width = 1000u32;
+            let index_height = ((f64::from(index_width) * slide_h / slide_w).round() as u32).max(1);
+            let scale = f64::from(index_width) / slide_w;
+            let placed = place_slide(pres, slide_index);
+            let links = extract_slide_links(
+                pres,
+                slide_index,
+                &placed,
+                index_width,
+                index_height,
+                scale,
+            );
+            (index_height, links)
+        }
+        DocumentBackend::Word(word) => {
+            if slide_index >= word.page_count() {
+                return Vec::new();
+            }
+            let (page_w, page_h) = word.page_size(slide_index);
+            let index_width = 1000u32;
+            let index_height = ((f64::from(index_width) * page_h / page_w).round() as u32).max(1);
+            let scale = f64::from(index_width) / page_w;
+            let links = word.extract_page_links(slide_index, index_width, index_height, scale);
+            (index_height, links)
+        }
+        DocumentBackend::Excel(excel) => {
+            if slide_index >= excel.page_count() {
+                return Vec::new();
+            }
+            let (page_w, page_h) = excel.page_size(slide_index);
+            let index_width = 1000u32;
+            let index_height = ((f64::from(index_width) * page_h / page_w).round() as u32).max(1);
+            let scale = f64::from(index_width) / page_w;
+            let links = excel.extract_page_links(slide_index, index_width, index_height, scale);
+            (index_height, links)
+        }
+    };
     let source_text = cached_slide_text(doc, page).map(|text| normalize_context_text(&text.raw));
     let mut label_occurrences = HashMap::<String, usize>::new();
     links
@@ -1675,47 +1797,46 @@ fn extract_slide_text(doc: &mut OpenPresentation, page: u32) -> String {
 
 fn cached_slide_text(doc: &mut OpenPresentation, page: u32) -> Option<&CachedSlideText> {
     let index = usize::try_from(page).ok()?;
-    if index >= doc.presentation.slides.len() {
+    if index >= doc.text_cache.len() {
         return None;
     }
     if doc.text_cache[index].is_none() {
-        let placed = place_slide(&doc.presentation, index);
-        let mut raw = String::new();
-        let mut char_rects = Vec::new();
-        for pt in &placed.texts {
-            let body_text = pt.body.text();
-            if body_text.trim().is_empty() {
-                continue;
+        doc.text_cache[index] = Some(match &doc.backend {
+            DocumentBackend::Pptx(pres) => {
+                let placed = place_slide(pres, index);
+                let mut raw = String::new();
+                let mut char_rects = Vec::new();
+                for pt in &placed.texts {
+                    let body_text = pt.body.text();
+                    if body_text.trim().is_empty() {
+                        continue;
+                    }
+                    if !raw.is_empty() {
+                        raw.push('\n');
+                        char_rects.push(None);
+                    }
+                    for (char_idx, ch) in body_text.chars().enumerate() {
+                        raw.push(ch);
+                        let rect = placed_text_span_bbox(pt, char_idx, char_idx + 1);
+                        char_rects.push(rect);
+                    }
+                }
+                let notes_text = pres.slides[index].notes.text();
+                if !notes_text.trim().is_empty() {
+                    if !raw.is_empty() {
+                        raw.push_str("\n\n");
+                        char_rects.push(None);
+                        char_rects.push(None);
+                    }
+                    for ch in notes_text.chars() {
+                        raw.push(ch);
+                        char_rects.push(None);
+                    }
+                }
+                build_cached_text(raw, char_rects)
             }
-            if !raw.is_empty() {
-                raw.push('\n');
-                char_rects.push(None);
-            }
-            for (char_idx, ch) in body_text.chars().enumerate() {
-                raw.push(ch);
-                let rect = placed_text_span_bbox(pt, char_idx, char_idx + 1);
-                char_rects.push(rect);
-            }
-        }
-        let notes_text = doc.presentation.slides[index].notes.text();
-        if !notes_text.trim().is_empty() {
-            if !raw.is_empty() {
-                raw.push_str("\n\n");
-                char_rects.push(None);
-                char_rects.push(None);
-            }
-            for ch in notes_text.chars() {
-                raw.push(ch);
-                char_rects.push(None);
-            }
-        }
-        let (normalized, source_index_by_byte) =
-            normalize_search_characters(raw.chars().enumerate());
-        doc.text_cache[index] = Some(CachedSlideText {
-            raw,
-            normalized,
-            source_index_by_byte,
-            char_rects,
+            DocumentBackend::Word(word) => word.extract_cached_text(index),
+            DocumentBackend::Excel(excel) => excel.extract_cached_text(index),
         });
     }
     doc.text_cache[index].as_ref()
@@ -1933,7 +2054,7 @@ fn search_context(text: &str, match_start: usize, match_end: usize) -> String {
     snippet
 }
 
-fn normalize_context_text(text: &str) -> String {
+pub(crate) fn normalize_context_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -2372,9 +2493,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opens_renders_and_searches_docx_and_xlsx_documents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Word document (.docx)
+        let docx_path = dir.path().join("report.docx");
+        let mut word_doc = wordcraft_doc::Document::new();
+        let mut heading =
+            wordcraft_doc::Paragraph::with_text("Executive Summary", Default::default());
+        heading.props.style = Some("Heading1".to_string());
+        heading.props.outline_level = Some(0);
+        let body = wordcraft_doc::Paragraph::with_text(
+            "Revenue increased by 42% in Q3.",
+            Default::default(),
+        );
+        word_doc.body = vec![
+            wordcraft_doc::para_block(heading),
+            wordcraft_doc::para_block(body),
+        ];
+        std::fs::write(&docx_path, wordcraft_docx::write(&word_doc).unwrap()).unwrap();
+
+        let (mut wdoc, wpages, woutline, _) = open_presentation(&docx_path).unwrap();
+        assert!(wpages >= 1);
+        assert_eq!(woutline.len(), 1);
+        assert_eq!(woutline[0].title, "Executive Summary");
+        let wtext = extract_slide_text(&mut wdoc, 0);
+        assert!(wtext.contains("Executive Summary"));
+        assert!(wtext.contains("Revenue increased by 42%"));
+
+        let key = RenderKey {
+            document_id: 0,
+            page: 0,
+            width: 320,
+            height: 400,
+            zoom: 100,
+            fit: FitMode::Page,
+            invert: true,
+            dark_mode_style: DarkModeStyle::default(),
+            search_request_id: 0,
+            search_highlight: [0xff, 0xd7, 0x00],
+            link_mode: false,
+            link_highlight: [0x00, 0xd7, 0xff],
+            selected_link_ordinal: None,
+        };
+        let wframe = render_page(&mut wdoc, RenderRequest { key, generation: 1 })
+            .unwrap()
+            .unwrap();
+        assert!(wframe.width > 0 && wframe.height > 0);
+        assert!(!wframe.compressed_rgba.is_empty());
+
+        // Excel workbook (.xlsx)
+        let xlsx_path = dir.path().join("metrics.xlsx");
+        let mut wb = gridcraft_engine::model::Workbook::new();
+        {
+            use gridcraft_engine::core::{CellRef, Value};
+            let ws = Arc::make_mut(&mut wb.sheets[0]);
+            ws.name = "Financials".to_string();
+            ws.set_value(CellRef::new(0, 0), Value::from("Quarter"));
+            ws.set_value(CellRef::new(0, 1), Value::from("Revenue"));
+            ws.set_value(CellRef::new(1, 0), Value::from("Q3 2026"));
+            ws.set_value(CellRef::new(1, 1), Value::Number(125000.0));
+        }
+        std::fs::write(
+            &xlsx_path,
+            gridcraft_engine::io::save_bytes(&wb, "metrics.xlsx").unwrap(),
+        )
+        .unwrap();
+
+        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path).unwrap();
+        assert!(epages >= 1);
+        assert_eq!(eoutline.len(), 1);
+        assert_eq!(eoutline[0].title, "Financials");
+        let etext = extract_slide_text(&mut edoc, 0);
+        assert!(etext.contains("Quarter"));
+        assert!(etext.contains("Q3 2026"));
+
+        let eframe = render_page(&mut edoc, RenderRequest { key, generation: 1 })
+            .unwrap()
+            .unwrap();
+        assert!(eframe.width > 0 && eframe.height > 0);
+        assert!(!eframe.compressed_rgba.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
-    fn macos_font_home_redirects_office_cloud_fonts_to_pptxterm_cache() {
+    fn macos_font_home_redirects_office_cloud_fonts_to_officeterm_cache() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let user_fonts = home.join("Library/Fonts");
@@ -2391,7 +2595,7 @@ mod tests {
 
         let cloud_fonts_link =
             font_home.join("Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts");
-        let expected_cache = cache_base.join("pptxterm/fonts");
+        let expected_cache = cache_base.join("officeterm/fonts");
         assert_eq!(
             std::fs::read_link(&cloud_fonts_link).unwrap(),
             expected_cache

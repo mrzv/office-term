@@ -101,7 +101,7 @@ where
 pub enum AppError {
     #[error("viewer quit requested")]
     Quit,
-    #[error("pptxterm requires an interactive terminal")]
+    #[error("oterm requires an interactive terminal")]
     NotInteractive,
     #[error("{0}")]
     Renderer(String),
@@ -4876,7 +4876,7 @@ fn draw_picker(frame: &mut RatatuiFrame, browser: &BrowserState, filtering: bool
     }
     if lines.is_empty() {
         let message = if browser.filter.is_empty() {
-            "   No presentation files found"
+            "   No Office files found"
         } else {
             "   No matches"
         };

@@ -259,7 +259,7 @@ impl ForwardReply {
             stream.shutdown(Shutdown::Write)
         })();
         if let Err(error) = result {
-            eprintln!("pptxterm: ipc reply failed: {error}");
+            eprintln!("oterm: ipc reply failed: {error}");
         }
     }
 }

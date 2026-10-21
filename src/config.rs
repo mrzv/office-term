@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pptx::FitMode;
 
-/// Settings for the pptxterm viewer.
+/// Settings for the officeterm viewer.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -200,7 +200,7 @@ pub(crate) fn config_root() -> Option<PathBuf> {
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    Some(config_root()?.join("pptxterm"))
+    Some(config_root()?.join("officeterm"))
 }
 
 impl Default for Config {
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn creates_documented_config_without_overwriting_edits() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("pptxterm/config.toml");
+        let path = directory.path().join("officeterm/config.toml");
         Config::load_path(&path).unwrap();
         let template = fs::read_to_string(&path).unwrap();
         assert_eq!(template, include_str!("../config.default.toml"));

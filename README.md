@@ -1,6 +1,10 @@
-# pptxterm
+# officeterm (`oterm`)
 
-Minimal terminal presentation (`.pptx`, `.ppsx`, `.potx`) viewer built on `deckcraft` and the Kitty graphics protocol.
+Minimal terminal Office document viewer built on the ArtCraft collection (`deckcraft`, `wordcraft`, `gridcraft`) and the Kitty graphics protocol:
+
+- **PowerPoint presentations**: `.pptx`, `.ppsx`, `.potx`, `.pptm`, `.ppsm`, `.potm`
+- **Word documents**: `.docx`, `.docm`, `.dotx`, `.dotm`, `.doc`, `.dot`, `.rtf`, `.odt`
+- **Excel spreadsheets**: `.xlsx`, `.xlsm`, `.xltx`, `.xltm`, `.xls`, `.xlt`, `.xlsb`, `.ods`, `.csv`, `.tsv`
 
 ## Requirements
 
@@ -10,16 +14,16 @@ Minimal terminal presentation (`.pptx`, `.ppsx`, `.potx`) viewer built on `deckc
 ## Build and Run
 
 ```sh
-cargo run --release -- path/to/deck.pptx
+cargo run --release -- path/to/document.docx
 ```
 
-Or launch without a path to pick a presentation from the current directory tree:
+Or launch `oterm` without a path to pick an Office document from the current directory tree:
 
 ```sh
 cargo run --release
 ```
 
-Start on a specific 1-based slide:
+Start on a specific 1-based page/slide:
 
 ```sh
 cargo run --release -- --page 3 path/to/deck.pptx
@@ -35,10 +39,10 @@ Capture a PNG screenshot from a running named session:
 
 ```sh
 # In terminal 1:
-pptxterm --session demo path/to/deck.pptx
+oterm --session demo path/to/deck.pptx
 
 # In terminal 2:
-pptxterm --session demo --screenshot slide.png
+oterm --session demo --screenshot page.png
 ```
 
 ## Controls

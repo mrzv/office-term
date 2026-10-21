@@ -52,7 +52,7 @@ fn recent_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("pptxterm").join("recent"))
+    Some(base.join("officeterm").join("recent"))
 }
 
 #[cfg(test)]

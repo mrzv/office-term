@@ -6,10 +6,10 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PPTX file to open. Omit to open the file picker.
+    /// Office file to open. Omit to open the file picker.
     path: Option<PathBuf>,
 
-    /// One-based slide number to show first.
+    /// One-based page/slide number to show first.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     page: u32,
 
@@ -21,22 +21,22 @@ struct Cli {
     #[arg(long)]
     session: Option<String>,
 
-    /// Save the running viewer's visible PPTX viewport as a PNG.
+    /// Save the running viewer's visible document viewport as a PNG.
     #[arg(long, requires = "session", conflicts_with = "path")]
     screenshot: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut config = match pptxterm::config::Config::load() {
+    let mut config = match officeterm::config::Config::load() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("pptxterm: {error}");
+            eprintln!("oterm: {error}");
             return ExitCode::FAILURE;
         }
     };
     if let Err(error) = config.select_session(cli.session.as_deref()) {
-        eprintln!("pptxterm: {error}");
+        eprintln!("oterm: {error}");
         return ExitCode::FAILURE;
     }
     if cli.print_config {
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Err(error) => {
-                eprintln!("pptxterm: {error}");
+                eprintln!("oterm: {error}");
                 return ExitCode::FAILURE;
             }
         }
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
             let socket = config
                 .forward_socket()
                 .ok_or("forward_socket is disabled")?;
-            pptxterm::ipc::screenshot(socket, path)?;
+            officeterm::ipc::screenshot(socket, path)?;
             Ok(())
         })();
         return match result {
@@ -65,15 +65,15 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("pptxterm: {error}");
+                eprintln!("oterm: {error}");
                 ExitCode::FAILURE
             }
         };
     }
-    match pptxterm::app::run(cli.path, cli.page - 1, &config) {
-        Ok(()) | Err(pptxterm::app::AppError::Quit) => ExitCode::SUCCESS,
+    match officeterm::app::run(cli.path, cli.page - 1, &config) {
+        Ok(()) | Err(officeterm::app::AppError::Quit) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("pptxterm: {error}");
+            eprintln!("oterm: {error}");
             ExitCode::FAILURE
         }
     }

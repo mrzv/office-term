@@ -188,7 +188,7 @@ pub fn load_or_default(configured_path: Option<&str>) -> Palette {
     match load(configured_path) {
         Ok(theme) => theme,
         Err(error) => {
-            eprintln!("pptxterm: {error}; using the internal fallback palette");
+            eprintln!("oterm: {error}; using the internal fallback palette");
             TOKYO_NIGHT_MOON
         }
     }

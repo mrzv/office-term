@@ -1,9 +1,9 @@
-# pptxterm configuration. Created on first launch; existing files are never overwritten.
-# Default location: ~/.config/pptxterm/config.toml.
+# officeterm configuration. Created on first launch; existing files are never overwritten.
+# Default location: ~/.config/officeterm/config.toml.
 # XDG_CONFIG_HOME overrides ~/.config. Restart viewer after editing.
 
 fit_mode = "page"                  # page, width, height, or content
-dark_mode = false                  # Invert slide colors using the selected theme
+dark_mode = false                  # Invert page/slide colors using the selected theme
 theme = ""                         # Empty: built-in palette; otherwise a theme TOML path
 theme_catalog = ""                 # Empty: no external catalog; otherwise a catalog TOML path
 persistent_link_picker = false     # Keep link browser open after following a link
@@ -14,11 +14,11 @@ link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
 forward_socket = "forward.sock"    # Requires --session; empty disables viewer control even with a session
 
 [viewer]
-continuous_scroll = true           # Display adjacent slides together; false restores slide-at-a-time
-prefetch_pages = 5                 # Background-render this many slides on each side (0 disables)
+continuous_scroll = true           # Display adjacent pages/slides together; false restores page-at-a-time
+prefetch_pages = 5                 # Background-render this many pages on each side (0 disables)
 smooth_scroll = false              # Animate vertical wheel/j/k movement in continuous mode
 scroll_frame_ms = 16               # Minimum interval between animation frames, 1–1000 ms
 scroll_ease_divisor = 4            # Fraction of remaining distance per frame, 1–100 (1 = instant)
 scroll_step_percent = 12           # Small vertical movement as viewport percent, 1–100
 page_scroll_percent = 85           # Large vertical movement as viewport percent, 1–100
-set_window_title = true            # Set terminal/window title to active presentation filename
+set_window_title = true            # Set terminal/window title to active document filename
