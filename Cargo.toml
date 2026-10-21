@@ -12,12 +12,11 @@ base64 = "0.23.0"
 clap = { version = "4.6.5", features = ["derive"] }
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.15"
-deckcraft-fonts = { path = "../ArtCraft/deckcraft/crates/fonts" }
-deckcraft-format = { path = "../ArtCraft/deckcraft/crates/format" }
-deckcraft-model = { path = "../ArtCraft/deckcraft/crates/model" }
-deckcraft-pptx = { path = "../ArtCraft/deckcraft/crates/pptx" }
-deckcraft-render = { path = "../ArtCraft/deckcraft/crates/render" }
-deckcraft-text = { path = "../ArtCraft/deckcraft/crates/text" }
+deckcraft-fonts = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-format = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-model = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-pptx = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-render = { git = "https://github.com/storytold/deckcraft" }
 flate2 = "1.1.9"
 kurbo = "0.13"
 libc = "0.2"

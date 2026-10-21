@@ -392,6 +392,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-anim"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-geom",
  "deckcraft-model",
@@ -401,6 +402,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-color"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "serde",
 ]
@@ -408,6 +410,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-fonts"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "epaint_default_fonts",
  "harfrust",
@@ -420,6 +423,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-format"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-model",
  "serde",
@@ -431,6 +435,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-geom"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "kurbo",
  "serde",
@@ -439,6 +444,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-metafile"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "image",
  "kurbo",
@@ -448,6 +454,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-model"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-color",
  "deckcraft-geom",
@@ -460,6 +467,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-pptx"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-color",
  "deckcraft-geom",
@@ -473,6 +481,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-render"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-anim",
  "deckcraft-color",
@@ -492,6 +501,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-text"
 version = "0.9.0"
+source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "chrono",
  "deckcraft-color",
@@ -1194,7 +1204,6 @@ dependencies = [
  "deckcraft-model",
  "deckcraft-pptx",
  "deckcraft-render",
- "deckcraft-text",
  "flate2",
  "kurbo",
  "libc",
