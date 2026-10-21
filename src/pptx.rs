@@ -498,7 +498,7 @@ struct ActiveLinkIndex {
 }
 
 struct PendingCommands {
-    current: Option<RenderRequest>,
+    renders: VecDeque<RenderRequest>,
     prefetch: VecDeque<RenderRequest>,
     opens: VecDeque<(DocumentId, PathBuf)>,
     closes: VecDeque<DocumentId>,
@@ -511,7 +511,7 @@ struct PendingCommands {
 impl PendingCommands {
     fn new() -> Self {
         Self {
-            current: None,
+            renders: VecDeque::new(),
             prefetch: VecDeque::new(),
             opens: VecDeque::new(),
             closes: VecDeque::new(),
@@ -525,11 +525,29 @@ impl PendingCommands {
     fn ingest(&mut self, command: WorkerCommand) {
         match command {
             WorkerCommand::Render(request) => {
-                self.current = Some(request);
-                self.prefetch.clear();
+                self.renders
+                    .retain(|queued| queued.generation >= request.generation);
+                self.prefetch.retain(|queued| {
+                    queued.generation >= request.generation
+                        && !(queued.key == request.key && queued.generation == request.generation)
+                });
+                if !self
+                    .renders
+                    .iter()
+                    .any(|queued| queued.key == request.key && queued.generation == request.generation)
+                {
+                    self.renders.push_back(request);
+                }
             }
             WorkerCommand::Prefetch(request) => {
-                self.prefetch.push_back(request);
+                let already_queued = self
+                    .renders
+                    .iter()
+                    .chain(self.prefetch.iter())
+                    .any(|queued| queued.key == request.key && queued.generation == request.generation);
+                if !already_queued {
+                    self.prefetch.push_back(request);
+                }
             }
             WorkerCommand::Open { document_id, path } => {
                 self.opens.push_back((document_id, path));
@@ -569,7 +587,7 @@ impl PendingCommands {
     }
 
     fn is_empty(&self) -> bool {
-        self.current.is_none()
+        self.renders.is_empty()
             && self.prefetch.is_empty()
             && self.opens.is_empty()
             && self.closes.is_empty()
@@ -819,8 +837,8 @@ fn worker_loop(
             continue;
         }
 
-        if let Some(request) = pending.current.take() {
-            if request.generation < latest_generation.load(Ordering::Acquire) {
+        if let Some(request) = pending.renders.pop_front() {
+            if request.generation != latest_generation.load(Ordering::Acquire) {
                 continue;
             }
             let Some(doc) = documents.get_mut(&request.key.document_id) else {
@@ -843,7 +861,7 @@ fn worker_loop(
         }
 
         if let Some(request) = pending.prefetch.pop_front() {
-            if request.generation < latest_generation.load(Ordering::Acquire) {
+            if request.generation != latest_generation.load(Ordering::Acquire) {
                 continue;
             }
             let Some(doc) = documents.get_mut(&request.key.document_id) else {
@@ -912,9 +930,9 @@ fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Opt
     let page_height_pt = doc.presentation.slide_size.height.max(1.0) as f32;
     let content_bounds = slide_content_bounds(doc, key.page);
 
-    let zoom_scale = f64::from(key.zoom.max(10)) / 100.0;
-    let target_width = ((f64::from(key.width.max(1)) * zoom_scale).round() as u32).max(1);
-    let target_height = ((f64::from(key.height.max(1)) * zoom_scale).round() as u32).max(1);
+    let zoom = u32::from(key.zoom.max(1));
+    let target_width = (u32::from(key.width) * zoom / 100).max(1);
+    let target_height = (u32::from(key.height) * zoom / 100).max(1);
     let (width, height) = key.fit.raster_size(
         page_width_pt,
         page_height_pt,
@@ -922,21 +940,24 @@ fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Opt
         target_width,
         target_height,
     );
-
-    let scale = (f64::from(width) / doc.presentation.slide_size.width.max(1.0))
-        .min(f64::from(height) / doc.presentation.slide_size.height.max(1.0));
+    let (width, height) = clamp_to_max_side(width, height);
 
     let render_started = Instant::now();
-    let mut rgba = render_slide(
+    let image = render_slide(
         &doc.presentation,
         slide_index,
         &RenderOpts {
-            scale,
+            scale: (f64::from(width) / doc.presentation.slide_size.width.max(1.0))
+                .min(f64::from(height) / doc.presentation.slide_size.height.max(1.0)),
             size: Some((width, height)),
             ..Default::default()
         },
-    )
-    .to_straight();
+    );
+    let width = image.width.max(1);
+    let height = image.height.max(1);
+    let scale = (f64::from(width) / doc.presentation.slide_size.width.max(1.0))
+        .min(f64::from(height) / doc.presentation.slide_size.height.max(1.0));
+    let mut rgba = image.to_straight();
     let render_elapsed = render_started.elapsed();
 
     let placed = place_slide(&doc.presentation, slide_index);
@@ -998,6 +1019,21 @@ fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Opt
         generation: request.generation,
         links,
     }))
+}
+
+fn clamp_to_max_side(width: u32, height: u32) -> (u32, u32) {
+    let max_side = deckcraft_render::MAX_SIDE;
+    let width = width.max(1);
+    let height = height.max(1);
+    if width <= max_side && height <= max_side {
+        return (width, height);
+    }
+    let clamp_scale =
+        (f64::from(max_side) / f64::from(width)).min(f64::from(max_side) / f64::from(height));
+    (
+        ((f64::from(width) * clamp_scale).round() as u32).clamp(1, max_side),
+        ((f64::from(height) * clamp_scale).round() as u32).clamp(1, max_side),
+    )
 }
 
 fn slide_content_bounds(doc: &mut OpenPresentation, page: u32) -> [f32; 4] {
@@ -2011,5 +2047,243 @@ mod tests {
         let mask = raster_picture_mask(&pres, 0, 960, 540, 1.0).expect("picture mask");
         assert_eq!(mask[150 * 960 + 250], 255);
         assert_eq!(mask[30 * 960 + 20], 0);
+    }
+
+    #[test]
+    fn pending_commands_preserve_queued_renders_and_prefetches_in_same_generation() {
+        let base_key = RenderKey {
+            document_id: 1,
+            page: 0,
+            width: 800,
+            height: 600,
+            zoom: 100,
+            fit: FitMode::Page,
+            invert: false,
+            dark_mode_style: DarkModeStyle::default(),
+            search_request_id: 0,
+            search_highlight: [0xff, 0xd7, 0x00],
+            link_mode: false,
+            link_highlight: [0x00, 0xd7, 0xff],
+            selected_link_ordinal: None,
+        };
+        let key_for_page = |page: u32, zoom: u16| RenderKey {
+            page,
+            zoom,
+            ..base_key
+        };
+
+        let mut pending = PendingCommands::new();
+        pending.ingest(WorkerCommand::Render(RenderRequest {
+            key: key_for_page(0, 100),
+            generation: 1,
+        }));
+        pending.ingest(WorkerCommand::Prefetch(RenderRequest {
+            key: key_for_page(1, 100),
+            generation: 1,
+        }));
+        pending.ingest(WorkerCommand::Prefetch(RenderRequest {
+            key: key_for_page(2, 100),
+            generation: 1,
+        }));
+        // Visible render for page 1 promotes page 1 from prefetch to renders without dropping
+        // page 0 (already in renders) or page 2 (still in prefetch).
+        pending.ingest(WorkerCommand::Render(RenderRequest {
+            key: key_for_page(1, 100),
+            generation: 1,
+        }));
+
+        let render_pages: Vec<u32> = pending.renders.iter().map(|r| r.key.page).collect();
+        let prefetch_pages: Vec<u32> = pending.prefetch.iter().map(|r| r.key.page).collect();
+        assert_eq!(render_pages, vec![0, 1]);
+        assert_eq!(prefetch_pages, vec![2]);
+
+        // Starting generation 2 (e.g. zooming in to 110%) prunes generation 1 requests while
+        // keeping all generation 2 requests queued in the same generation.
+        pending.ingest(WorkerCommand::Render(RenderRequest {
+            key: key_for_page(0, 110),
+            generation: 2,
+        }));
+        pending.ingest(WorkerCommand::Render(RenderRequest {
+            key: key_for_page(1, 110),
+            generation: 2,
+        }));
+        let gen2_pages: Vec<(u32, u16, u64)> = pending
+            .renders
+            .iter()
+            .map(|r| (r.key.page, r.key.zoom, r.generation))
+            .collect();
+        assert_eq!(gen2_pages, vec![(0, 110, 2), (1, 110, 2)]);
+        assert!(pending.prefetch.is_empty());
+    }
+
+    #[test]
+    fn worker_delivers_all_visible_and_prefetched_slides_across_zoom_levels() {
+        let mut pres = Presentation::default();
+        pres.slides.clear();
+        for idx in 0..3u32 {
+            let mut slide = Slide {
+                id: SlideId(idx + 1),
+                ..Default::default()
+            };
+            slide.shapes.push(Shape {
+                id: ShapeId(10 + idx),
+                xfrm: Some(Xfrm::new(72.0, 54.0, 400.0, 80.0)),
+                kind: ShapeKind::Shape,
+                text_box: true,
+                text: Some(TextBody {
+                    paragraphs: vec![Paragraph {
+                        runs: vec![Run::new(format!("Slide {}", idx + 1))],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            pres.slides.push(slide.into());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.pptx");
+        std::fs::write(&path, deckcraft_pptx::export(&pres).unwrap()).unwrap();
+
+        let (worker, pages, _, _) = PptxWorker::spawn(path).unwrap();
+        assert_eq!(pages, 3);
+
+        let key_for = |page: u32, zoom: u16| RenderKey {
+            document_id: 1,
+            page,
+            width: 320,
+            height: 240,
+            zoom,
+            fit: FitMode::Page,
+            invert: false,
+            dark_mode_style: DarkModeStyle::default(),
+            search_request_id: 0,
+            search_highlight: [0xff, 0xd7, 0x00],
+            link_mode: false,
+            link_highlight: [0x00, 0xd7, 0xff],
+            selected_link_ordinal: None,
+        };
+
+        worker.begin_generation(1);
+        worker
+            .render(RenderRequest {
+                key: key_for(0, 100),
+                generation: 1,
+            })
+            .unwrap();
+        worker
+            .render(RenderRequest {
+                key: key_for(1, 100),
+                generation: 1,
+            })
+            .unwrap();
+        worker
+            .prefetch(RenderRequest {
+                key: key_for(2, 100),
+                generation: 1,
+            })
+            .unwrap();
+
+        let mut received_gen1 = Vec::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while received_gen1.len() < 3 && Instant::now() < deadline {
+            if let Some(WorkerMessage::Frame(frame)) = worker.try_recv()
+                && frame.generation == 1
+            {
+                received_gen1.push(frame.key.page);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(received_gen1, vec![0, 1, 2]);
+
+        // Now zoom in to 125% (generation 2) with two visible slides requested back-to-back.
+        worker.begin_generation(2);
+        worker
+            .render(RenderRequest {
+                key: key_for(0, 125),
+                generation: 2,
+            })
+            .unwrap();
+        worker
+            .render(RenderRequest {
+                key: key_for(1, 125),
+                generation: 2,
+            })
+            .unwrap();
+
+        let mut received_gen2 = Vec::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while received_gen2.len() < 2 && Instant::now() < deadline {
+            if let Some(WorkerMessage::Frame(frame)) = worker.try_recv()
+                && frame.generation == 2
+            {
+                received_gen2.push((frame.key.page, frame.width, frame.height));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(received_gen2, vec![(0, 400, 225), (1, 400, 225)]);
+    }
+
+    #[test]
+    fn zoom_and_large_raster_sizes_stay_within_renderer_bounds_and_match_rgba_payload() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zoom.pptx");
+        std::fs::write(&path, sample_pptx_bytes()).unwrap();
+        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+
+        for zoom in [100u16, 110, 125, 200, 400] {
+            let key = RenderKey {
+                document_id: 1,
+                page: 0,
+                width: 320,
+                height: 180,
+                zoom,
+                fit: FitMode::Page,
+                invert: true,
+                dark_mode_style: DarkModeStyle::default(),
+                search_request_id: 0,
+                search_highlight: [0xff, 0xd7, 0x00],
+                link_mode: false,
+                link_highlight: [0x00, 0xd7, 0xff],
+                selected_link_ordinal: None,
+            };
+            let frame = render_page(&mut doc, RenderRequest { key, generation: 1 })
+                .unwrap()
+                .unwrap();
+            let target_width = (u32::from(key.width) * u32::from(key.zoom) / 100).max(1);
+            let target_height = (u32::from(key.height) * u32::from(key.zoom) / 100).max(1);
+            let expected = key.fit.raster_size(
+                frame.page_width_pt,
+                frame.page_height_pt,
+                frame.content_bounds,
+                target_width,
+                target_height,
+            );
+            assert_eq!((frame.width, frame.height), expected);
+
+            let mut decompressed = Vec::new();
+            flate2::read::ZlibDecoder::new(frame.compressed_rgba.as_slice())
+                .read_to_end(&mut decompressed)
+                .unwrap();
+            assert_eq!(
+                decompressed.len(),
+                (frame.width as usize) * (frame.height as usize) * 4
+            );
+        }
+
+        // Verify that oversized dimensions exceeding deckcraft_render::MAX_SIDE are clamped
+        // proportionally while preserving aspect ratio.
+        assert_eq!(
+            clamp_to_max_side(20_000, 11_250),
+            (deckcraft_render::MAX_SIDE, 9_000)
+        );
+        assert_eq!(
+            clamp_to_max_side(9_000, 20_000),
+            (7_200, deckcraft_render::MAX_SIDE)
+        );
     }
 }
