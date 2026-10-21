@@ -123,6 +123,7 @@ pub fn run(path: Option<PathBuf>, start_page: u32, config: &Config) -> Result<()
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::NotInteractive);
     }
+    crate::pptx::init_font_db();
 
     let mut output = io::BufWriter::new(io::stdout().lock());
 

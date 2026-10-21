@@ -328,6 +328,91 @@ pub struct PptxWorker {
     handle: Option<JoinHandle<()>>,
 }
 
+/// Initializes the global `deckcraft-fonts` database before any background threads are spawned.
+///
+/// On macOS, `deckcraft_fonts::system_font_dirs()` includes
+/// `$HOME/Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts`. Reading inside
+/// `~/Library/Group Containers` from a terminal triggers a macOS TCC prompt (`"kitty" would like
+/// to access data from other apps`). To avoid touching Microsoft Office's group container while
+/// still keeping user-installed fonts (`~/Library/Fonts`) and giving `pptxterm` its own font
+/// cache (`~/.cache/pptxterm/fonts`), we point `HOME` at a synthetic `<cache>/pptxterm/font-home`
+/// directory while `FontDb::global()` records its search paths, then immediately restore `HOME`.
+pub fn init_font_db() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        #[cfg(target_os = "macos")]
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && !home.as_os_str().is_empty()
+        {
+            let cache_base = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| home.join(".cache"));
+            if let Ok(font_home) = prepare_macos_font_home(&home, &cache_base) {
+                struct HomeGuard(PathBuf);
+                impl Drop for HomeGuard {
+                    fn drop(&mut self) {
+                        // SAFETY: `init_font_db` runs on the main thread during startup before
+                        // any worker or file-browser threads are spawned.
+                        unsafe {
+                            std::env::set_var("HOME", &self.0);
+                        }
+                    }
+                }
+                let _restore = HomeGuard(home);
+                // SAFETY: `init_font_db` runs on the main thread during startup before any
+                // worker or file-browser threads are spawned.
+                unsafe {
+                    std::env::set_var("HOME", &font_home);
+                }
+                let _ = FontDb::global();
+                return;
+            }
+        }
+        let _ = FontDb::global();
+    });
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ensure_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    if let Ok(existing) = std::fs::read_link(link) {
+        if existing == target {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(link);
+    } else if link.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(link).or_else(|_| std::fs::remove_dir_all(link));
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, link);
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prepare_macos_font_home(home: &Path, cache_base: &Path) -> io::Result<PathBuf> {
+    let app_cache = cache_base.join("pptxterm");
+    let font_cache = app_cache.join("fonts");
+    std::fs::create_dir_all(&font_cache)?;
+
+    let font_home = app_cache.join("font-home");
+    let library_dir = font_home.join("Library");
+    std::fs::create_dir_all(&library_dir)?;
+    ensure_symlink(&home.join("Library/Fonts"), &library_dir.join("Fonts"))?;
+
+    let office_cache_parent =
+        library_dir.join("Group Containers/UBF8T346G9.Office/FontCache/4");
+    std::fs::create_dir_all(&office_cache_parent)?;
+    ensure_symlink(&font_cache, &office_cache_parent.join("CloudFonts"))?;
+
+    Ok(font_home)
+}
+
 impl PptxWorker {
     pub fn spawn(
         path: PathBuf,
@@ -2285,5 +2370,33 @@ mod tests {
             clamp_to_max_side(9_000, 20_000),
             (7_200, deckcraft_render::MAX_SIDE)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_font_home_redirects_office_cloud_fonts_to_pptxterm_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let user_fonts = home.join("Library/Fonts");
+        std::fs::create_dir_all(&user_fonts).unwrap();
+        let cache_base = dir.path().join("cache");
+
+        let font_home = prepare_macos_font_home(&home, &cache_base).unwrap();
+        // Calling a second time is idempotent.
+        let font_home_again = prepare_macos_font_home(&home, &cache_base).unwrap();
+        assert_eq!(font_home, font_home_again);
+
+        let fonts_link = font_home.join("Library/Fonts");
+        assert_eq!(std::fs::read_link(&fonts_link).unwrap(), user_fonts);
+
+        let cloud_fonts_link =
+            font_home.join("Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts");
+        let expected_cache = cache_base.join("pptxterm/fonts");
+        assert_eq!(
+            std::fs::read_link(&cloud_fonts_link).unwrap(),
+            expected_cache
+        );
+        assert!(expected_cache.is_dir());
+        assert!(!home.join("Library/Group Containers").exists());
     }
 }
