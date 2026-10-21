@@ -1,0 +1,11 @@
+pub mod app;
+pub mod browser;
+pub mod config;
+pub mod ipc;
+pub mod kitty;
+pub mod pptx;
+pub mod process;
+pub mod recent;
+pub mod screenshot;
+pub mod terminal;
+pub mod theme;

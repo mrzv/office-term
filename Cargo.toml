@@ -1,0 +1,39 @@
+[package]
+name = "pptxterm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/mrzv/pptxterm"
+description = "A low-latency PPTX presentation viewer for Kitty terminals"
+license = "MIT"
+
+[dependencies]
+base64 = "0.23.0"
+clap = { version = "4.6.5", features = ["derive"] }
+crossterm = "0.29.0"
+crossbeam-channel = "0.5.15"
+deckcraft-fonts = { path = "../ArtCraft/deckcraft/crates/fonts" }
+deckcraft-format = { path = "../ArtCraft/deckcraft/crates/format" }
+deckcraft-model = { path = "../ArtCraft/deckcraft/crates/model" }
+deckcraft-pptx = { path = "../ArtCraft/deckcraft/crates/pptx" }
+deckcraft-render = { path = "../ArtCraft/deckcraft/crates/render" }
+deckcraft-text = { path = "../ArtCraft/deckcraft/crates/text" }
+flate2 = "1.1.9"
+kurbo = "0.13"
+libc = "0.2"
+nucleo-matcher = "0.3.1"
+png = "0.18.0"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.17"
+toml = "1.1.6"
+unicode-normalization = "0.1.24"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
