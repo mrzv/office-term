@@ -9,9 +9,9 @@ use gridcraft_engine::cmd::print::{
 use gridcraft_engine::core::{CellRef, MAX_COLS, RangeRef, Value, col_to_letters};
 use gridcraft_engine::links::{LinkKind, classify};
 use gridcraft_engine::model::{
-    Anchor, BorderLine, BorderStyle, Borders, Color, HAlign, HfPage, PatternType, ShapeKind,
-    ShapeTextAlign, ShapeTextAnchor, Sheet, Style, StyleId, StyleTable, Underline, VAlign,
-    Visibility, Workbook,
+    Anchor, BorderLine, BorderStyle, Borders, Color, HAlign, HfPage, Orientation, PatternType,
+    ShapeKind, ShapeTextAlign, ShapeTextAnchor, Sheet, Style, StyleId, StyleTable, Underline,
+    VAlign, Visibility, Workbook,
 };
 use gridcraft_engine::numfmt::{FormatColor, format_general_fit};
 use kurbo::Rect as KurboRect;
@@ -86,16 +86,31 @@ impl ExcelDocument {
             if wb.sheets[si].visibility != Visibility::Visible {
                 continue;
             }
-            let sh = &wb.sheets[si];
-            let Some(mut lay) = layout_sheet(&wb, si, &opts, None) else {
+            configure_landscape_fit_width(Arc::make_mut(&mut wb.sheets[si]));
+            let Some(content_range) = sheet_content_range(&wb.sheets[si]) else {
                 continue;
             };
+            let Some(mut lay) = layout_sheet(&wb, si, &opts, Some(content_range)) else {
+                continue;
+            };
+            let sh = &wb.sheets[si];
             lay.settings.gridlines = sh.show_gridlines || sh.print.gridlines;
-            if lay.pages.is_empty() {
-                lay.area = RangeRef::new(CellRef::new(0, 0), CellRef::new(9, 6));
-                lay.row_bands = vec![(0, 9)];
-                lay.col_bands = vec![(0, 6)];
-                lay.pages = vec![(0, 0)];
+            let mut sheet_specs = Vec::new();
+            for &(ri, ci) in &lay.pages {
+                let Some(row_band) = lay.row_bands.get(ri).copied() else {
+                    continue;
+                };
+                let Some(col_band) = lay.col_bands.get(ci).copied() else {
+                    continue;
+                };
+                let Some(trimmed_rows) = trim_band_rows(sh, row_band, col_band) else {
+                    continue;
+                };
+                let sheet_page_idx = sheet_specs.len();
+                sheet_specs.push((sheet_page_idx, trimmed_rows, col_band));
+            }
+            if sheet_specs.is_empty() {
+                continue;
             }
             let first_page_idx = pages.len();
             outline.push(OutlineItem {
@@ -104,14 +119,8 @@ impl ExcelDocument {
                 depth: 0,
             });
             let layout_idx = layouts.len();
-            let multi_page = lay.pages.len() > 1;
-            for (sheet_page_idx, &(ri, ci)) in lay.pages.iter().enumerate() {
-                let Some(row_band) = lay.row_bands.get(ri).copied() else {
-                    continue;
-                };
-                let Some(col_band) = lay.col_bands.get(ci).copied() else {
-                    continue;
-                };
+            let multi_page = sheet_specs.len() > 1;
+            for (sheet_page_idx, row_band, col_band) in sheet_specs {
                 let page_idx = pages.len();
                 pages.push(ExcelPageSpec {
                     layout_idx,
@@ -134,28 +143,34 @@ impl ExcelDocument {
             layouts.push(lay);
         }
 
-        if pages.is_empty()
-            && !wb.sheets.is_empty()
-            && let Some(mut lay) = layout_sheet(&wb, 0, &opts, None)
-        {
-            let sh = &wb.sheets[0];
-            lay.settings.gridlines = sh.show_gridlines || sh.print.gridlines;
-            lay.area = RangeRef::new(CellRef::new(0, 0), CellRef::new(9, 6));
-            lay.row_bands = vec![(0, 9)];
-            lay.col_bands = vec![(0, 6)];
-            lay.pages = vec![(0, 0)];
-            outline.push(OutlineItem {
-                title: sh.name.clone(),
-                page: 0,
-                depth: 0,
-            });
-            pages.push(ExcelPageSpec {
-                layout_idx: 0,
-                sheet_page_idx: 0,
-                row_band: (0, 9),
-                col_band: (0, 6),
-            });
-            layouts.push(lay);
+        if pages.is_empty() && !wb.sheets.is_empty() {
+            let fallback_si = wb
+                .sheets
+                .iter()
+                .position(|s| s.visibility == Visibility::Visible)
+                .unwrap_or(0);
+            configure_landscape_fit_width(Arc::make_mut(&mut wb.sheets[fallback_si]));
+            let default_area = RangeRef::new(CellRef::new(0, 0), CellRef::new(9, 6));
+            if let Some(mut lay) = layout_sheet(&wb, fallback_si, &opts, Some(default_area)) {
+                let sh = &wb.sheets[fallback_si];
+                lay.settings.gridlines = sh.show_gridlines || sh.print.gridlines;
+                lay.area = default_area;
+                lay.row_bands = vec![(0, 9)];
+                lay.col_bands = vec![(0, 6)];
+                lay.pages = vec![(0, 0)];
+                outline.push(OutlineItem {
+                    title: sh.name.clone(),
+                    page: 0,
+                    depth: 0,
+                });
+                pages.push(ExcelPageSpec {
+                    layout_idx: 0,
+                    sheet_page_idx: 0,
+                    row_band: (0, 9),
+                    col_band: (0, 6),
+                });
+                layouts.push(lay);
+            }
         }
 
         if pages.is_empty() {
@@ -789,6 +804,249 @@ impl ExcelDocument {
 fn parse_first_cell(s: &str) -> Option<CellRef> {
     let first = s.split(':').next()?.trim().replace('$', "");
     CellRef::parse(&first)
+}
+
+fn configure_landscape_fit_width(sh: &mut Sheet) {
+    if sh.print.paper.trim().eq_ignore_ascii_case("ledger") {
+        sh.print.paper = "Tabloid".to_string();
+    }
+    sh.print.orientation = Orientation::Landscape;
+    sh.print.fit_to = Some((1, 0));
+    sh.print.print_area = None;
+}
+
+fn value_has_content(v: &Value) -> bool {
+    match v {
+        Value::Empty => false,
+        Value::Text(s) => !s.trim().is_empty(),
+        Value::Number(_) | Value::Bool(_) | Value::Error(_) => true,
+        Value::Array(items) => items.iter().any(value_has_content),
+    }
+}
+
+fn cell_has_direct_content(sh: &Sheet, c: CellRef) -> bool {
+    if let Some(cell) = sh.cells.get(c)
+        && (value_has_content(&cell.value) || (sh.show_formulas && cell.formula.is_some()))
+    {
+        return true;
+    }
+    if sh.spill.get(&c).is_some_and(value_has_content) {
+        return true;
+    }
+    if sh.cell_pictures.get(&c).is_some_and(|p| !p.data.is_empty()) {
+        return true;
+    }
+    if sh.comments.get(&c).is_some_and(|cm| !cm.text.trim().is_empty()) {
+        return true;
+    }
+    if sh.hyperlinks.contains_key(&c) {
+        return true;
+    }
+    sh.sparklines.iter().any(|sp| sp.cell == c)
+}
+
+fn anchor_cell_range(sh: &Sheet, a: &Anchor) -> Option<RangeRef> {
+    if a.width <= 0.0 || a.height <= 0.0 {
+        return None;
+    }
+    let (x, y, w, h) = anchor_rect(sh, a);
+    let start = CellRef::new(sh.row_at(y), sh.col_at(x));
+    let end = CellRef::new(
+        sh.row_at((y + h - 1e-3).max(y)),
+        sh.col_at((x + w - 1e-3).max(x)),
+    );
+    Some(RangeRef::new(start, end))
+}
+
+fn extend_bounds(bounds: &mut Option<RangeRef>, r: RangeRef) {
+    *bounds = Some(bounds.map_or(r, |b| b.union(&r)));
+}
+
+fn sheet_content_range(sh: &Sheet) -> Option<RangeRef> {
+    let mut bounds: Option<RangeRef> = None;
+
+    for (c, cell) in sh.cells.iter() {
+        if value_has_content(&cell.value) || (sh.show_formulas && cell.formula.is_some()) {
+            extend_bounds(&mut bounds, RangeRef::cell(c));
+        }
+    }
+    for (&c, val) in &sh.spill {
+        if value_has_content(val) {
+            extend_bounds(&mut bounds, RangeRef::cell(c));
+        }
+    }
+    for (&c, pic) in &sh.cell_pictures {
+        if !pic.data.is_empty() {
+            extend_bounds(&mut bounds, RangeRef::cell(c));
+        }
+    }
+    for sp in &sh.sparklines {
+        extend_bounds(&mut bounds, RangeRef::cell(sp.cell));
+    }
+    for (&c, cm) in &sh.comments {
+        if !cm.text.trim().is_empty() {
+            extend_bounds(&mut bounds, RangeRef::cell(c));
+        }
+    }
+    for &c in sh.hyperlinks.keys() {
+        extend_bounds(&mut bounds, RangeRef::cell(c));
+    }
+    for t in &sh.tables {
+        if let Some(hr) = t.header_range() {
+            extend_bounds(&mut bounds, hr);
+        }
+        if let Some(tr) = t.totals_range() {
+            extend_bounds(&mut bounds, tr);
+        }
+    }
+    for p in &sh.pivots {
+        if let Some(pr) = p.last_range {
+            extend_bounds(&mut bounds, pr);
+        }
+    }
+    for ch in &sh.charts {
+        if let Some(r) = anchor_cell_range(sh, &ch.anchor) {
+            extend_bounds(&mut bounds, r);
+        }
+    }
+    for im in &sh.images {
+        if !im.data.is_empty()
+            && let Some(r) = anchor_cell_range(sh, &im.anchor)
+        {
+            extend_bounds(&mut bounds, r);
+        }
+    }
+    for shp in &sh.shapes {
+        if let Some(r) = anchor_cell_range(sh, &shp.anchor) {
+            extend_bounds(&mut bounds, r);
+        }
+    }
+    for sl in &sh.slicers {
+        if let Some(r) = anchor_cell_range(sh, &sl.anchor) {
+            extend_bounds(&mut bounds, r);
+        }
+    }
+    for m in &sh.merges {
+        if m.is_full_rows() || m.is_full_cols() {
+            continue;
+        }
+        if cell_has_direct_content(sh, m.start) || bounds.is_some_and(|b| b.contains(m.start)) {
+            extend_bounds(&mut bounds, *m);
+        }
+    }
+
+    bounds
+}
+
+fn mark_band_rows(
+    min_r: &mut Option<u32>,
+    max_r: &mut Option<u32>,
+    row_band: (u32, u32),
+    r0: u32,
+    r1: u32,
+) {
+    let a = r0.min(r1).max(row_band.0);
+    let b = r0.max(r1).min(row_band.1);
+    if a <= b {
+        *min_r = Some(min_r.map_or(a, |m| m.min(a)));
+        *max_r = Some(max_r.map_or(b, |m| m.max(b)));
+    }
+}
+
+fn trim_band_rows(sh: &Sheet, row_band: (u32, u32), col_band: (u32, u32)) -> Option<(u32, u32)> {
+    let band = RangeRef::new(
+        CellRef::new(row_band.0, col_band.0),
+        CellRef::new(row_band.1, col_band.1),
+    );
+    let mut min_r: Option<u32> = None;
+    let mut max_r: Option<u32> = None;
+
+    for (c, cell) in sh.cells.iter_range(band) {
+        if value_has_content(&cell.value) || (sh.show_formulas && cell.formula.is_some()) {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, c.row, c.row);
+        }
+    }
+    for (&c, val) in sh.spill.range(band.start..=band.end) {
+        if band.contains(c) && value_has_content(val) {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, c.row, c.row);
+        }
+    }
+    for (&c, pic) in &sh.cell_pictures {
+        if band.contains(c) && !pic.data.is_empty() {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, c.row, c.row);
+        }
+    }
+    for sp in &sh.sparklines {
+        if band.contains(sp.cell) {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, sp.cell.row, sp.cell.row);
+        }
+    }
+    for (&c, cm) in &sh.comments {
+        if band.contains(c) && !cm.text.trim().is_empty() {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, c.row, c.row);
+        }
+    }
+    for &c in sh.hyperlinks.keys() {
+        if band.contains(c) {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, c.row, c.row);
+        }
+    }
+    for t in &sh.tables {
+        for r in [t.header_range(), t.totals_range()].into_iter().flatten() {
+            if r.intersects(&band) {
+                mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+            }
+        }
+    }
+    for p in &sh.pivots {
+        if let Some(r) = p.last_range
+            && r.intersects(&band)
+        {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+        }
+    }
+    for ch in &sh.charts {
+        if let Some(r) = anchor_cell_range(sh, &ch.anchor)
+            && r.intersects(&band)
+        {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+        }
+    }
+    for im in &sh.images {
+        if !im.data.is_empty()
+            && let Some(r) = anchor_cell_range(sh, &im.anchor)
+            && r.intersects(&band)
+        {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+        }
+    }
+    for shp in &sh.shapes {
+        if let Some(r) = anchor_cell_range(sh, &shp.anchor)
+            && r.intersects(&band)
+        {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+        }
+    }
+    for sl in &sh.slicers {
+        if let Some(r) = anchor_cell_range(sh, &sl.anchor)
+            && r.intersects(&band)
+        {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, r.start.row, r.end.row);
+        }
+    }
+    for m in &sh.merges {
+        if m.is_full_rows() || m.is_full_cols() || !m.intersects(&band) {
+            continue;
+        }
+        let in_active_rows = min_r
+            .zip(max_r)
+            .is_some_and(|(lo, hi)| m.start.row >= lo && m.start.row <= hi);
+        if cell_has_direct_content(sh, m.start) || in_active_rows {
+            mark_band_rows(&mut min_r, &mut max_r, row_band, m.start.row, m.end.row);
+        }
+    }
+
+    min_r.zip(max_r)
 }
 
 #[derive(Clone, Copy)]

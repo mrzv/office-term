@@ -2573,7 +2573,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(eframe.width > 0 && eframe.height > 0);
+        assert!(eframe.page_width_pt > eframe.page_height_pt);
         assert!(!eframe.compressed_rgba.is_empty());
+    }
+
+    #[test]
+    fn excel_landscape_fit_width_trims_empty_cells_and_skips_blank_pages() {
+        use gridcraft_engine::core::{CellRef, RangeRef, Value};
+        use gridcraft_engine::model::{Cell, Color, Fill, Formula, PatternType, Style, StyleId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let xlsx_path = dir.path().join("wide_and_sparse.xlsx");
+        let mut wb = gridcraft_engine::model::Workbook::new();
+        let style_id = wb.styles.intern(Style {
+            fill: Fill {
+                pattern: PatternType::Solid,
+                fg: Color::Rgb(0xEEEEEE),
+                bg: Color::Auto,
+            },
+            ..Style::default()
+        });
+        {
+            let ws = Arc::make_mut(&mut wb.sheets[0]);
+            ws.name = "WideSheet".to_string();
+            // 14 columns wide (A..N), which would split across multiple pages in portrait mode.
+            for col in 0..14 {
+                ws.set_value(CellRef::new(0, col), Value::from(format!("Header {col}")));
+                ws.set_value(CellRef::new(1, col), Value::Number(f64::from(col) * 10.0));
+            }
+            // Add styled-only empty cells and an empty formula far away; these should be ignored.
+            ws.set_style(CellRef::new(400, 20), style_id);
+            ws.set_cell(
+                CellRef::new(450, 15),
+                Cell {
+                    value: Value::from(""),
+                    formula: Some(Arc::new(Formula::new("\"\""))),
+                    style: StyleId::DEFAULT,
+                },
+            );
+            // Set an oversized print area; it should be ignored in favor of tight content bounds.
+            ws.print.print_area =
+                Some(RangeRef::new(CellRef::new(0, 0), CellRef::new(500, 25)));
+        }
+        std::fs::write(
+            &xlsx_path,
+            gridcraft_engine::io::save_bytes(&wb, "wide_and_sparse.xlsx").unwrap(),
+        )
+        .unwrap();
+
+        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path).unwrap();
+        assert_eq!(epages, 1);
+        assert_eq!(eoutline.len(), 1);
+        let etext = extract_slide_text(&mut edoc, 0);
+        assert!(etext.contains("Header 0"));
+        assert!(etext.contains("Header 13"));
+
+        // Verify sparse vertical data skips intermediate blank page bands.
+        let sparse_path = dir.path().join("sparse_rows.xlsx");
+        let mut wb2 = gridcraft_engine::model::Workbook::new();
+        {
+            let ws = Arc::make_mut(&mut wb2.sheets[0]);
+            ws.name = "Sparse".to_string();
+            ws.set_value(CellRef::new(0, 0), Value::from("Top block"));
+            ws.set_value(CellRef::new(200, 0), Value::from("Bottom block"));
+        }
+        std::fs::write(
+            &sparse_path,
+            gridcraft_engine::io::save_bytes(&wb2, "sparse_rows.xlsx").unwrap(),
+        )
+        .unwrap();
+
+        let (mut sdoc, spages, _, _) = open_presentation(&sparse_path).unwrap();
+        assert_eq!(spages, 2);
+        assert!(extract_slide_text(&mut sdoc, 0).contains("Top block"));
+        assert!(extract_slide_text(&mut sdoc, 1).contains("Bottom block"));
     }
 
     #[cfg(unix)]
