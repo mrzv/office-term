@@ -2,7 +2,7 @@
 name = "officeterm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 repository = "https://github.com/mrzv/officeterm"
 description = "A low-latency Office document viewer (PowerPoint, Word, Excel) for Kitty terminals"
 license = "MIT"
@@ -48,6 +48,9 @@ wordcraft-render = { git = "https://github.com/storytold/wordcraft" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[patch."https://github.com/storytold/wordcraft"]
+wordcraft-doc = { path = "vendor/wordcraft-doc" }
 
 [profile.release]
 lto = "thin"

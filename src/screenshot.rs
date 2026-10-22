@@ -151,6 +151,21 @@ fn compose(
     Ok(output)
 }
 
+fn encode_png(
+    writer: impl io::Write,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), png::EncodingError> {
+    let mut encoder = Encoder::new(writer, width, height);
+    encoder.set_color(ColorType::Rgba);
+    encoder.set_depth(BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    writer.finish()?;
+    Ok(())
+}
+
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn save(
@@ -199,20 +214,15 @@ pub fn save(
         }
     };
     let (temp_path, file) = temp;
-    let encoded = (|| -> io::Result<()> {
-        let mut encoder = Encoder::new(
-            file,
-            u32::from(viewport.pixel_width),
-            u32::from(viewport.pixel_height),
-        );
-        encoder.set_color(ColorType::Rgba);
-        encoder.set_depth(BitDepth::Eight);
-        encoder.write_header()?.write_image_data(&rgba)?;
-        Ok(())
-    })();
+    let encoded = encode_png(
+        file,
+        u32::from(viewport.pixel_width),
+        u32::from(viewport.pixel_height),
+        &rgba,
+    );
     if let Err(error) = encoded {
         let _ = fs::remove_file(&temp_path);
-        return Err(error);
+        return Err(error.into());
     }
     if let Err(error) = fs::hard_link(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
@@ -227,6 +237,31 @@ mod tests {
     use super::*;
     use crate::pptx::{DarkModeStyle, DocumentRevision, FitMode, RenderKey};
     use std::time::Duration;
+    #[test]
+    fn png_finalization_errors_are_reported() {
+        struct FailIend;
+        impl io::Write for FailIend {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes == b"IEND" {
+                    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = encode_png(FailIend, 1, 1, &[0, 0, 0, 255]).unwrap_err();
+        match error {
+            png::EncodingError::IoError(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            }
+            error => panic!("expected finalization I/O failure, got {error:?}"),
+        }
+    }
 
     #[test]
     fn screenshot_uses_page_crop_and_viewport_origin() {

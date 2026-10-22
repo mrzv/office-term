@@ -515,10 +515,13 @@ fn collect_presentation_files(root: &Path, op: &Operation) -> Vec<(String, PathB
                 .stdout
                 .split(|byte| *byte == 0)
                 .filter(|relative| !relative.is_empty())
+                .take_while(|_| op.check().is_ok())
                 .map(|relative| Path::new(OsStr::from_bytes(relative)))
                 .filter(|relative| is_presentation(relative))
+                .map(|relative| (relative, root.join(relative)))
+                .filter(|(_, path)| path.is_file())
                 .take(MAX_RECURSIVE_FILES)
-                .map(|relative| (relative.to_string_lossy().into_owned(), root.join(relative)))
+                .map(|(relative, path)| (relative.to_string_lossy().into_owned(), path))
                 .collect();
             files.sort_by(|left, right| left.0.cmp(&right.0));
             return files;
@@ -715,6 +718,46 @@ mod tests {
     }
 
     #[test]
+    fn git_collection_excludes_missing_and_nonfile_documents() {
+        use super::{Operation, collect_presentation_files};
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root)
+                .status()
+                .expect("initialize repository")
+                .success()
+        );
+        for name in ["kept.docx", "deleted.docx", "directory.docx"] {
+            fs::write(root.join(name), b"synthetic").expect("write document");
+        }
+        symlink("kept.docx", root.join("linked.docx")).expect("document symlink");
+        symlink("missing.docx", root.join("broken.docx")).expect("broken symlink");
+        assert!(
+            Command::new("git")
+                .args(["add", "--", "."])
+                .current_dir(root)
+                .status()
+                .expect("stage documents")
+                .success()
+        );
+        fs::remove_file(root.join("deleted.docx")).expect("delete indexed document");
+        fs::remove_file(root.join("directory.docx")).expect("remove indexed document");
+        fs::create_dir(root.join("directory.docx")).expect("replace document with directory");
+
+        let files = collect_presentation_files(root, &Operation::default());
+        let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(names, ["kept.docx", "linked.docx"]);
+        assert!(files.iter().all(|(_, path)| path.is_file()));
+    }
+
+    #[test]
     fn recursive_collection_honors_depth_limit_and_cancellation() {
         use super::{MAX_RECURSIVE_DEPTH, Operation, collect_presentation_files_recursive};
 
@@ -737,8 +780,16 @@ mod tests {
             &mut files,
         );
         assert_eq!(files.len(), MAX_RECURSIVE_DEPTH + 1);
-        assert!(files.iter().any(|(name, _)| name.ends_with(&format!("deck-{MAX_RECURSIVE_DEPTH}.pptx"))));
-        assert!(!files.iter().any(|(name, _)| name.ends_with(&format!("deck-{}.pptx", MAX_RECURSIVE_DEPTH + 1))));
+        assert!(
+            files
+                .iter()
+                .any(|(name, _)| name.ends_with(&format!("deck-{MAX_RECURSIVE_DEPTH}.pptx")))
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|(name, _)| name.ends_with(&format!("deck-{}.pptx", MAX_RECURSIVE_DEPTH + 1)))
+        );
 
         // Pre-cancelled operation collects nothing.
         let cancelled_op = Operation::default();

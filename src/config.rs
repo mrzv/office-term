@@ -91,13 +91,6 @@ impl Config {
                 }
                 runtime.join(configured)
             };
-            // macOS sockaddr_un.sun_path has 104 bytes, including the NUL.
-            if resolved.as_os_str().as_encoded_bytes().len() > 103 {
-                return Err(
-                    format!("socket path exceeds 103 bytes: {}", resolved.display()).into(),
-                );
-            }
-            crate::ipc::private_dir(resolved.parent().ok_or("socket path has no parent")?)?;
             *value = resolved
                 .into_os_string()
                 .into_string()
@@ -137,6 +130,11 @@ impl Config {
                     "named session socket path exceeds 103 bytes",
                 ));
             }
+            crate::ipc::private_dir(
+                selected
+                    .parent()
+                    .ok_or_else(|| io::Error::other("socket path has no parent"))?,
+            )?;
             *value = selected
                 .into_os_string()
                 .into_string()
@@ -324,6 +322,40 @@ mod tests {
     #[test]
     fn rejects_unknown_keys() {
         assert!(toml::from_str::<Config>("future_option = 42").is_err());
+    }
+
+    #[test]
+    fn unused_socket_does_not_restrict_config_directory_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("x".repeat(120)).join("config.toml");
+        let mut config = Config::load_path(&path).unwrap();
+        assert!(!path.parent().unwrap().join("run").exists());
+        assert!(config.select_session(Some("demo")).is_err());
+        config.select_session(None).unwrap();
+        assert_eq!(config.forward_socket(), None);
+        assert!(!path.parent().unwrap().join("run").exists());
+    }
+
+    #[test]
+    fn socket_parent_permissions_are_checked_only_for_named_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::Builder::new()
+            .prefix("oterm-config-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.path().join("config.toml");
+        let socket = directory.path().join("viewer.sock");
+        fs::write(
+            &path,
+            format!("forward_socket = {:?}", socket.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut config = Config::load_path(&path).unwrap();
+        assert!(config.select_session(Some("demo")).is_err());
+        config.select_session(None).unwrap();
+        assert_eq!(config.forward_socket(), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ link_picker_split_percent = 50     # Link pane size, 20–80 percent
 link_picker_layout = "auto"         # auto, vertical, horizontal, or floating
 # Relative names resolve inside the private config-directory/run directory (mode 0700).
 # Absolute paths require a current-user-owned mode-0700 parent. Never use shared /tmp directly.
+# Socket length and parent permissions are checked only when --session enables control.
 forward_socket = "forward.sock"    # Requires --session; empty disables viewer control even with a session
 
 [viewer]

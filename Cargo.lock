@@ -2446,7 +2446,6 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wordcraft-doc"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "serde",
  "serde_json",

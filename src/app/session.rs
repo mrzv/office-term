@@ -34,6 +34,17 @@ pub(super) struct Tab {
 }
 
 impl Tab {
+    pub(super) fn replace_search(&mut self, search: SearchState) {
+        self.search = search;
+        self.retain_search_frames();
+    }
+
+    pub(super) fn retain_search_frames(&mut self) {
+        let search = &self.search;
+        self.cache
+            .retain(|key, _| key.search_request_id == search.highlight_request_id(key.page));
+    }
+
     pub(super) fn render_key(
         &self,
         viewport: Viewport,

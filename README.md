@@ -8,7 +8,7 @@ Minimal terminal Office document viewer built on the ArtCraft collection (`deckc
 
 ## Requirements
 
-- Rust 1.88+ (Edition 2024)
+- Rust 1.95+ (Edition 2024; required by the locked font dependencies)
 - A terminal that supports the Kitty graphics protocol and reports pixel dimensions cleanly (`kitty`, `Ghostty`, `WezTerm`)
 
 ## Build and Run
@@ -44,6 +44,25 @@ oterm --session demo path/to/deck.pptx
 # In terminal 2:
 oterm --session demo --screenshot page.png
 ```
+
+Relative screenshot paths resolve from the requesting command's working directory,
+not the viewer's. Existing destination files are never overwritten.
+
+## Configuration and stored state
+
+Configuration lives at `$XDG_CONFIG_HOME/officeterm/config.toml`, or
+`~/.config/officeterm/config.toml` when `XDG_CONFIG_HOME` is unset. IPC socket
+length and private-directory requirements apply only when `--session` enables
+viewer control; ordinary viewing does not create the socket directory.
+
+Recent-file history stores Unix path bytes in JSON, preserving newlines and
+non-UTF8 filenames. The previous newline-delimited history is ignored and replaced
+when a document is next recorded.
+
+The vendored `wordcraft-doc` crate is pinned to upstream revision
+`ff3c7d8d25bd8271326f372cb90f2c8106ec4d92`. Its symbol-font lookup recognizes
+document-specific aliases so embedded font subsets stay isolated without changing
+Word symbol shaping or extracted text.
 
 ## Controls
 

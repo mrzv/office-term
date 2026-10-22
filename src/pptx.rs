@@ -408,8 +408,7 @@ fn prepare_macos_font_home(home: &Path, cache_base: &Path) -> io::Result<PathBuf
     std::fs::create_dir_all(&library_dir)?;
     ensure_symlink(&home.join("Library/Fonts"), &library_dir.join("Fonts"))?;
 
-    let office_cache_parent =
-        library_dir.join("Group Containers/UBF8T346G9.Office/FontCache/4");
+    let office_cache_parent = library_dir.join("Group Containers/UBF8T346G9.Office/FontCache/4");
     std::fs::create_dir_all(&office_cache_parent)?;
     ensure_symlink(&font_cache, &office_cache_parent.join("CloudFonts"))?;
 
@@ -417,9 +416,7 @@ fn prepare_macos_font_home(home: &Path, cache_base: &Path) -> io::Result<PathBuf
 }
 
 impl PptxWorker {
-    pub fn spawn(
-        path: PathBuf,
-    ) -> Result<(Self, u32, Vec<OutlineItem>, DocumentRevision), String> {
+    pub fn spawn(path: PathBuf) -> Result<(Self, u32, Vec<OutlineItem>, DocumentRevision), String> {
         let (command_tx, command_rx) = unbounded();
         let (message_tx, message_rx) = unbounded();
         let generation = Arc::new(AtomicU64::new(0));
@@ -580,8 +577,7 @@ pub(crate) fn build_cached_text(
     raw: String,
     char_rects: Vec<Option<ModelRect>>,
 ) -> CachedSlideText {
-    let (normalized, source_index_by_byte) =
-        normalize_search_characters(raw.chars().enumerate());
+    let (normalized, source_index_by_byte) = normalize_search_characters(raw.chars().enumerate());
     CachedSlideText {
         raw,
         normalized,
@@ -639,35 +635,42 @@ impl PendingCommands {
                     queued.generation >= request.generation
                         && !(queued.key == request.key && queued.generation == request.generation)
                 });
-                if !self
-                    .renders
-                    .iter()
-                    .any(|queued| queued.key == request.key && queued.generation == request.generation)
-                {
+                if !self.renders.iter().any(|queued| {
+                    queued.key == request.key && queued.generation == request.generation
+                }) {
                     self.renders.push_back(request);
                 }
             }
             WorkerCommand::Prefetch(request) => {
-                let already_queued = self
-                    .renders
-                    .iter()
-                    .chain(self.prefetch.iter())
-                    .any(|queued| queued.key == request.key && queued.generation == request.generation);
+                let already_queued =
+                    self.renders
+                        .iter()
+                        .chain(self.prefetch.iter())
+                        .any(|queued| {
+                            queued.key == request.key && queued.generation == request.generation
+                        });
                 if !already_queued {
                     self.prefetch.push_back(request);
                 }
             }
             WorkerCommand::Open { document_id, path } => {
-                self.opens.retain(|(queued_id, _)| *queued_id != document_id);
+                self.opens
+                    .retain(|(queued_id, _)| *queued_id != document_id);
                 self.opens.push_back((document_id, path));
             }
             WorkerCommand::Close { document_id } => {
-                self.renders.retain(|queued| queued.key.document_id != document_id);
-                self.prefetch.retain(|queued| queued.key.document_id != document_id);
-                self.opens.retain(|(queued_id, _)| *queued_id != document_id);
-                self.text_requests.retain(|(queued_id, _)| *queued_id != document_id);
-                self.searches.retain(|(queued_id, _, _)| *queued_id != document_id);
-                self.link_indices.retain(|(queued_id, _)| *queued_id != document_id);
+                self.renders
+                    .retain(|queued| queued.key.document_id != document_id);
+                self.prefetch
+                    .retain(|queued| queued.key.document_id != document_id);
+                self.opens
+                    .retain(|(queued_id, _)| *queued_id != document_id);
+                self.text_requests
+                    .retain(|(queued_id, _)| *queued_id != document_id);
+                self.searches
+                    .retain(|(queued_id, _, _)| *queued_id != document_id);
+                self.link_indices
+                    .retain(|(queued_id, _)| *queued_id != document_id);
                 self.closes.push_back(document_id);
             }
             WorkerCommand::ExtractText { document_id, page } => {
@@ -678,14 +681,16 @@ impl PendingCommands {
                 request_id,
                 query,
             } => {
-                self.searches.retain(|(queued_id, _, _)| *queued_id != document_id);
+                self.searches
+                    .retain(|(queued_id, _, _)| *queued_id != document_id);
                 self.searches.push_back((document_id, request_id, query));
             }
             WorkerCommand::IndexLinks {
                 document_id,
                 request_id,
             } => {
-                self.link_indices.retain(|(queued_id, _)| *queued_id != document_id);
+                self.link_indices
+                    .retain(|(queued_id, _)| *queued_id != document_id);
                 self.link_indices.push_back((document_id, request_id));
             }
             WorkerCommand::Shutdown => {
@@ -830,7 +835,11 @@ fn open_presentation(
             let pages = u32::try_from(presentation.slides.len())
                 .map_err(|_| "presentation has too many slides".to_string())?;
             let outline = collect_outline(&presentation);
-            (DocumentBackend::Pptx(Box::new(presentation)), pages, outline)
+            (
+                DocumentBackend::Pptx(Box::new(presentation)),
+                pages,
+                outline,
+            )
         }
         _ => unreachable!(),
     };
@@ -1128,7 +1137,10 @@ fn worker_loop(
     }
 }
 
-fn render_page(doc: &mut OpenPresentation, request: RenderRequest) -> Result<Option<Frame>, String> {
+fn render_page(
+    doc: &mut OpenPresentation,
+    request: RenderRequest,
+) -> Result<Option<Frame>, String> {
     let key = request.key;
     let Ok(slide_index) = usize::try_from(key.page) else {
         return Ok(None);
@@ -1308,21 +1320,12 @@ fn slide_content_bounds(doc: &mut OpenPresentation, page: u32) -> [f32; 4] {
             visit_slide_shapes(pres, slide_index, |shape, rect| {
                 if !matches!(shape.kind, ShapeKind::Group { .. }) {
                     include_rect_bounds(
-                        rect,
-                        &mut min_x,
-                        &mut min_y,
-                        &mut max_x,
-                        &mut max_y,
-                        slide_w,
-                        slide_h,
+                        rect, &mut min_x, &mut min_y, &mut max_x, &mut max_y, slide_w, slide_h,
                     );
                 }
             });
 
-            if min_x.is_finite()
-                && min_y.is_finite()
-                && max_x > min_x + 1.0
-                && max_y > min_y + 1.0
+            if min_x.is_finite() && min_y.is_finite() && max_x > min_x + 1.0 && max_y > min_y + 1.0
             {
                 let pad_x = (slide_w * 0.02).max(4.0);
                 let pad_y = (slide_h * 0.02).max(4.0);
@@ -1385,9 +1388,7 @@ fn visit_slide_shapes(
                 visit_shape(Some(&mctx), shape, kurbo::Affine::IDENTITY, 0, &mut f);
             }
         }
-        if show_layout
-            && let Some(layout) = rctx.layout
-        {
+        if show_layout && let Some(layout) = rctx.layout {
             let lctx = resolve::Ctx::for_layout(presentation, rctx.master, layout);
             for shape in layout.shapes.iter().filter(|s| s.ph.is_none()) {
                 visit_shape(Some(&lctx), shape, kurbo::Affine::IDENTITY, 0, &mut f);
@@ -1424,8 +1425,16 @@ fn visit_shape(
     let rect = transform_rect_bbox(&m, KurboRect::new(0.0, 0.0, x.w, x.h));
     f(shape, rect);
     if let ShapeKind::Group { children, child } = &shape.kind {
-        let sx = if child.w.abs() > 1e-9 { x.w / child.w } else { 1.0 };
-        let sy = if child.h.abs() > 1e-9 { x.h / child.h } else { 1.0 };
+        let sx = if child.w.abs() > 1e-9 {
+            x.w / child.w
+        } else {
+            1.0
+        };
+        let sy = if child.h.abs() > 1e-9 {
+            x.h / child.h
+        } else {
+            1.0
+        };
         let gm = m
             * kurbo::Affine::scale_non_uniform(sx, sy)
             * kurbo::Affine::translate(kurbo::Vec2::new(-child.x, -child.y));
@@ -1444,7 +1453,10 @@ fn raster_picture_mask(
 ) -> Option<Vec<u8>> {
     let mut rects = Vec::new();
     visit_slide_shapes(presentation, slide_index, |shape, rect| {
-        if matches!(shape.kind, ShapeKind::Picture { .. }) && rect.width() > 0.0 && rect.height() > 0.0 {
+        if matches!(shape.kind, ShapeKind::Picture { .. })
+            && rect.width() > 0.0
+            && rect.height() > 0.0
+        {
             rects.push(rect);
         }
     });
@@ -1491,9 +1503,12 @@ pub(crate) fn darken_rgba(rgba: &mut [u8], image_mask: Option<&[u8]>, style: Dar
                 } else {
                     let keep = u16::from(masked);
                     let flip = 255 - keep;
-                    pixel[0] = ((u16::from(pixel[0]) * keep + u16::from(r) * flip + 127) / 255) as u8;
-                    pixel[1] = ((u16::from(pixel[1]) * keep + u16::from(g) * flip + 127) / 255) as u8;
-                    pixel[2] = ((u16::from(pixel[2]) * keep + u16::from(b) * flip + 127) / 255) as u8;
+                    pixel[0] =
+                        ((u16::from(pixel[0]) * keep + u16::from(r) * flip + 127) / 255) as u8;
+                    pixel[1] =
+                        ((u16::from(pixel[1]) * keep + u16::from(g) * flip + 127) / 255) as u8;
+                    pixel[2] =
+                        ((u16::from(pixel[2]) * keep + u16::from(b) * flip + 127) / 255) as u8;
                 }
             }
         }
@@ -1657,11 +1672,12 @@ fn extract_slide_links(
         let mut char_offset = 0usize;
         for para in &pt.body.paragraphs {
             for run in &para.runs {
-                let run_len = run.text.chars().count();
+                let run_len = run.char_len();
                 if let Some(hlink) = &run.props.link
                     && let Some(target) =
                         resolve_hyperlink(presentation, slide_index, total_slides, hlink)
-                    && let Some(bbox) = placed_text_span_bbox(pt, char_offset, char_offset + run_len)
+                    && let Some(bbox) =
+                        placed_text_span_bbox(pt, char_offset, char_offset + run_len)
                     && let Some(rect) = bbox_to_page_link_rect(bbox, width, height, scale)
                 {
                     let label = normalize_context_text(&run.text);
@@ -1722,11 +1738,13 @@ fn resolve_hyperlink(
             top_ratio: None,
             left_ratio: None,
         }),
-        Action::LastSlide => total_slides.checked_sub(1).map(|last| LinkTarget::Internal {
-            page: last as u32,
-            top_ratio: None,
-            left_ratio: None,
-        }),
+        Action::LastSlide => total_slides
+            .checked_sub(1)
+            .map(|last| LinkTarget::Internal {
+                page: last as u32,
+                top_ratio: None,
+                left_ratio: None,
+            }),
         _ => None,
     }
 }
@@ -1744,15 +1762,29 @@ fn placed_text_span_bbox(
     char_end: usize,
 ) -> Option<KurboRect> {
     let mut union: Option<KurboRect> = None;
-    for line in &pt.layout.lines {
-        if let Some((x0, x1)) = line.span(char_start, char_end) {
-            let local = KurboRect::new(x0, line.top, x1, line.bottom);
-            let rect = transform_rect_bbox(&pt.transform, local);
-            union = Some(match union {
-                Some(prev) => prev.union(rect),
-                None => rect,
-            });
+    let mut paragraph_start = 0;
+    for (para_index, paragraph) in pt.body.paragraphs.iter().enumerate() {
+        let paragraph_end = paragraph_start + paragraph.char_len();
+        let start = char_start.max(paragraph_start);
+        let end = char_end.min(paragraph_end);
+        if start < end {
+            for line in pt
+                .layout
+                .lines
+                .iter()
+                .filter(|line| line.para == para_index)
+            {
+                if let Some((x0, x1)) = line.span(start - paragraph_start, end - paragraph_start) {
+                    let local = KurboRect::new(x0, line.top, x1, line.bottom);
+                    let rect = transform_rect_bbox(&pt.transform, local);
+                    union = Some(match union {
+                        Some(prev) => prev.union(rect),
+                        None => rect,
+                    });
+                }
+            }
         }
+        paragraph_start = paragraph_end + 1;
     }
     union
 }
@@ -1815,14 +1847,8 @@ fn index_slide_links(doc: &mut OpenPresentation, page: u32) -> Vec<DocumentLink>
             let index_height = ((f64::from(index_width) * slide_h / slide_w).round() as u32).max(1);
             let scale = f64::from(index_width) / slide_w;
             let placed = place_slide(pres, slide_index);
-            let links = extract_slide_links(
-                pres,
-                slide_index,
-                &placed,
-                index_width,
-                index_height,
-                scale,
-            );
+            let links =
+                extract_slide_links(pres, slide_index, &placed, index_width, index_height, scale);
             (index_height, scale, links)
         }
         DocumentBackend::Word(word) => {
@@ -1916,17 +1942,29 @@ fn cached_slide_text(doc: &mut OpenPresentation, page: u32) -> Option<&CachedSli
                     }
                     let lines = &pt.layout.lines;
                     let mut line_idx = 0usize;
+                    let mut para_index = 0;
+                    let mut para_start = 0;
+                    let mut para_end = pt.body.paragraphs.first().map_or(0, |para| para.char_len());
                     for (char_idx, ch) in body_text.chars().enumerate() {
                         raw.push(ch);
+                        while char_idx > para_end {
+                            para_index += 1;
+                            para_start = para_end + 1;
+                            para_end = para_start + pt.body.paragraphs[para_index].char_len();
+                        }
+                        let local_idx = char_idx - para_start;
                         while line_idx < lines.len()
-                            && lines[line_idx].span(char_idx, usize::MAX).is_none()
+                            && (lines[line_idx].para < para_index
+                                || (lines[line_idx].para == para_index
+                                    && lines[line_idx].end <= local_idx))
                         {
                             line_idx += 1;
                         }
                         let rect = lines
                             .get(line_idx)
+                            .filter(|line| line.para == para_index && char_idx < para_end)
                             .and_then(|line| {
-                                let (x0, x1) = line.span(char_idx, char_idx + 1)?;
+                                let (x0, x1) = line.span(local_idx, local_idx + 1)?;
                                 let local = KurboRect::new(x0, line.top, x1, line.bottom);
                                 Some(transform_rect_bbox(&pt.transform, local))
                             });
@@ -1973,10 +2011,7 @@ fn search_match_pixel_rects(
         let Some(&first_char) = cached.source_index_by_byte.get(start) else {
             continue;
         };
-        let Some(&last_char) = cached
-            .source_index_by_byte
-            .get(end.saturating_sub(1))
-        else {
+        let Some(&last_char) = cached.source_index_by_byte.get(end.saturating_sub(1)) else {
             continue;
         };
         let mut union: Option<ModelRect> = None;
@@ -2088,15 +2123,16 @@ pub(crate) fn normalize_search_query(query: &str) -> String {
     normalize_search_characters(query.chars().enumerate()).0
 }
 
-fn normalize_search_characters(
-    chars: impl Iterator<Item = (usize, char)>,
-) -> (String, Vec<usize>) {
+fn normalize_search_characters(chars: impl Iterator<Item = (usize, char)>) -> (String, Vec<usize>) {
     let mut normalized = String::new();
     let mut source_index_by_byte = Vec::new();
     let mut pending_space_index = None;
 
     for (source_index, character) in chars {
-        if matches!(character, '\u{00ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}') {
+        if matches!(
+            character,
+            '\u{00ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+        ) {
             continue;
         }
         if character.is_whitespace() {
@@ -2150,16 +2186,8 @@ fn search_context(text: &str, match_start: usize, match_end: usize) -> String {
         .rev()
         .take(36)
         .collect::<Vec<_>>();
-    let start = match_start
-        - before
-            .iter()
-            .map(|ch| ch.len_utf8())
-            .sum::<usize>();
-    let after_len: usize = text[match_end..]
-        .chars()
-        .take(64)
-        .map(char::len_utf8)
-        .sum();
+    let start = match_start - before.iter().map(|ch| ch.len_utf8()).sum::<usize>();
+    let after_len: usize = text[match_end..].chars().take(64).map(char::len_utf8).sum();
     let end = match_end + after_len;
     let mut snippet = String::new();
     if start > 0 {
@@ -2233,7 +2261,8 @@ fn context_around_link(
             let Some(&first_char) = source_index_by_byte.get(start) else {
                 return false;
             };
-            let Some(&last_char) = source_index_by_byte.get(start + matched.len().saturating_sub(1))
+            let Some(&last_char) =
+                source_index_by_byte.get(start + matched.len().saturating_sub(1))
             else {
                 return false;
             };
@@ -2368,9 +2397,13 @@ mod tests {
         assert_eq!(frame.width, 320);
         assert_eq!(frame.height, 180);
         assert!(!frame.compressed_rgba.is_empty());
-        assert!(frame.content_bounds[0] >= 0.0 && frame.content_bounds[0] < frame.content_bounds[2]);
+        assert!(
+            frame.content_bounds[0] >= 0.0 && frame.content_bounds[0] < frame.content_bounds[2]
+        );
         assert!(frame.content_bounds[2] <= 1.0);
-        assert!(frame.content_bounds[1] >= 0.0 && frame.content_bounds[1] < frame.content_bounds[3]);
+        assert!(
+            frame.content_bounds[1] >= 0.0 && frame.content_bounds[1] < frame.content_bounds[3]
+        );
         assert!(frame.content_bounds[3] <= 1.0);
 
         let content_key = RenderKey {
@@ -2536,10 +2569,7 @@ mod tests {
         });
         assert_eq!(
             pending.searches.iter().cloned().collect::<Vec<_>>(),
-            vec![
-                (2, 20, "other".to_string()),
-                (1, 11, "updated".to_string()),
-            ]
+            vec![(2, 20, "other".to_string()), (1, 11, "updated".to_string()),]
         );
 
         pending.ingest(WorkerCommand::IndexLinks {
@@ -2647,6 +2677,290 @@ mod tests {
         assert!(
             ctx.contains("Follow the actual portal link here for details."),
             "unexpected link context: {ctx}"
+        );
+    }
+
+    #[test]
+    fn paragraph_local_geometry_drives_links_and_search_highlights() {
+        let linked = |text: &str| {
+            let mut run = Run::new(text);
+            run.props.link = Some(Hyperlink {
+                action: Action::Url {
+                    url: "https://example.com".into(),
+                },
+                tooltip: String::new(),
+                highlight_click: false,
+                sound: None,
+                stop_sound: false,
+                zoom_return: None,
+            });
+            run
+        };
+        let prefix = "A long prefix that wraps onto another line before ";
+        let mut pres = Presentation::default();
+        pres.slides.clear();
+        let mut slide = Slide {
+            id: SlideId(1),
+            show_master_shapes: false,
+            ..Default::default()
+        };
+        slide.shapes.push(Shape {
+            id: ShapeId(2),
+            xfrm: Some(Xfrm::new(40.0, 50.0, 170.0, 450.0)),
+            kind: ShapeKind::Shape,
+            text_box: true,
+            text: Some(TextBody {
+                paragraphs: vec![
+                    Paragraph {
+                        runs: vec![linked("First")],
+                        ..Default::default()
+                    },
+                    Paragraph::default(),
+                    Paragraph {
+                        runs: vec![
+                            Run::new(prefix),
+                            Run {
+                                kind: deckcraft_model::text::RunKind::Break,
+                                ..Run::new("")
+                            },
+                            linked("Target"),
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        pres.slides.push(slide.into());
+        let placed = place_slide(&pres, 0);
+        let pt = &placed.texts[0];
+        assert!(pt.layout.lines.iter().filter(|line| line.para == 2).count() > 1);
+        let expected = |para, start, end| {
+            pt.layout
+                .lines
+                .iter()
+                .filter(|line| line.para == para)
+                .filter_map(|line| {
+                    let (x0, x1) = line.span(start, end)?;
+                    Some(transform_rect_bbox(
+                        &pt.transform,
+                        KurboRect::new(x0, line.top, x1, line.bottom),
+                    ))
+                })
+                .reduce(|a, b| a.union(b))
+                .unwrap()
+        };
+        let first_bbox = expected(0, 0, 5);
+        let target_start = prefix.chars().count() + 1;
+        let target_bbox = expected(2, target_start, target_start + 6);
+        let body_target_start = 5 + 2 + target_start;
+        assert_eq!(placed_text_span_bbox(pt, 0, 5), Some(first_bbox));
+        assert_eq!(
+            placed_text_span_bbox(pt, body_target_start, body_target_start + 6),
+            Some(target_bbox)
+        );
+        assert!(first_bbox.y1 < target_bbox.y0);
+        let links = extract_slide_links(&pres, 0, &placed, 1000, 1000, 1.0);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0].rect,
+            bbox_to_page_link_rect(first_bbox, 1000, 1000, 1.0).unwrap()
+        );
+        assert_eq!(
+            links[1].rect,
+            bbox_to_page_link_rect(target_bbox, 1000, 1000, 1.0).unwrap()
+        );
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut doc = OpenPresentation {
+            backend: DocumentBackend::Pptx(Box::new(pres)),
+            revision: DocumentRevision::read(file.path()).unwrap(),
+            pages: 1,
+            text_cache: vec![None],
+            content_bounds_cache: HashMap::new(),
+            active_search: None,
+        };
+        let cached = cached_slide_text(&mut doc, 0).unwrap();
+        assert_eq!(cached.raw, format!("First\n\n{prefix}\u{b}Target"));
+        assert_eq!(cached.char_rects[5], None);
+        assert_eq!(cached.char_rects[6], None);
+        for offset in 0..6 {
+            assert!(cached.char_rects[body_target_start + offset].is_some());
+        }
+        let rects = search_match_pixel_rects(&mut doc, 0, "target", 1000, 1000, 1.0);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].left, target_bbox.x0.floor() as u32);
+        assert_eq!(rects[0].top, target_bbox.y0.floor() as u32);
+        assert_eq!(rects[0].right, target_bbox.x1.ceil() as u32);
+        assert_eq!(rects[0].bottom, target_bbox.y1.ceil() as u32);
+    }
+
+    #[test]
+    fn active_search_finishes_with_other_document_work_but_cancels_for_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.pptx");
+        std::fs::write(&path, sample_pptx_bytes()).unwrap();
+        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+        let (commands, incoming) = unbounded();
+        let (messages, results) = unbounded();
+        let mut pending = PendingCommands::new();
+        commands
+            .send(WorkerCommand::Search {
+                document_id: 2,
+                request_id: 20,
+                query: "overview".into(),
+            })
+            .unwrap();
+        assert!(search_document(
+            1,
+            &mut doc,
+            10,
+            "quarterly",
+            &incoming,
+            &mut pending,
+            &messages
+        ));
+        match results.try_recv().unwrap() {
+            WorkerMessage::SearchResults {
+                document_id,
+                request_id,
+                total_occurrences,
+                ..
+            } => {
+                assert_eq!((document_id, request_id, total_occurrences), (1, 10, 1));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(pending.searches.front().unwrap().0, 2);
+        commands
+            .send(WorkerCommand::Search {
+                document_id: 1,
+                request_id: 11,
+                query: String::new(),
+            })
+            .unwrap();
+        assert!(search_document(
+            1,
+            &mut doc,
+            10,
+            "quarterly",
+            &incoming,
+            &mut pending,
+            &messages
+        ));
+        assert!(results.try_recv().is_err());
+        assert_eq!(pending.searches.len(), 2);
+        assert!(search_document(
+            1,
+            &mut doc,
+            11,
+            "",
+            &incoming,
+            &mut pending,
+            &messages
+        ));
+        match results.try_recv().unwrap() {
+            WorkerMessage::SearchResults {
+                document_id,
+                request_id,
+                total_occurrences,
+                ..
+            } => {
+                assert_eq!((document_id, request_id, total_occurrences), (1, 11, 0));
+            }
+            other => panic!("unexpected cancellation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_completes_queued_jobs_for_both_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.pptx");
+        let mut pres = load_presentation_from_bytes(&path, &sample_pptx_bytes()).unwrap();
+        let template = pres.slides[0].as_ref().clone();
+        for id in 2..=3 {
+            let mut slide = template.clone();
+            slide.id = SlideId(id);
+            pres.slides.push(slide.into());
+        }
+        std::fs::write(&path, deckcraft_pptx::export(&pres).unwrap()).unwrap();
+        let (commands, incoming) = unbounded();
+        let (messages, results) = unbounded();
+        commands
+            .send(WorkerCommand::Open {
+                document_id: 2,
+                path: path.clone(),
+            })
+            .unwrap();
+        for document_id in [1, 2] {
+            commands
+                .send(WorkerCommand::Search {
+                    document_id,
+                    request_id: document_id * 10,
+                    query: "overview".into(),
+                })
+                .unwrap();
+            commands
+                .send(WorkerCommand::IndexLinks {
+                    document_id,
+                    request_id: document_id * 100,
+                })
+                .unwrap();
+        }
+        // Closing input lets the real worker drain every queued/active job and
+        // terminate without making font/layout speed a wall-clock assertion.
+        drop(commands);
+        worker_loop(
+            path,
+            incoming,
+            messages,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let received: Vec<_> = results.try_iter().collect();
+        assert_eq!(received.len(), 10);
+        let mut searches = Vec::new();
+        let mut indices = Vec::new();
+        for message in received {
+            match message {
+                WorkerMessage::Ready { .. } | WorkerMessage::Opened { document_id: 2, .. } => {}
+                WorkerMessage::SearchResults {
+                    document_id,
+                    request_id,
+                    total_occurrences,
+                    ..
+                } => {
+                    assert_eq!(total_occurrences, 3);
+                    searches.push((document_id, request_id));
+                }
+                WorkerMessage::LinkIndexProgress {
+                    document_id,
+                    request_id,
+                    scanned,
+                    total,
+                    complete,
+                    ..
+                } => {
+                    assert_eq!(total, 3);
+                    assert_eq!(complete, scanned == total);
+                    assert!((1..=3).contains(&scanned));
+                    indices.push((document_id, request_id, scanned));
+                }
+                other => panic!("unexpected worker message: {other:?}"),
+            }
+        }
+        assert_eq!(searches, [(1, 10), (2, 20)]);
+        assert_eq!(
+            indices,
+            [
+                (1, 100, 1),
+                (1, 100, 2),
+                (1, 100, 3),
+                (2, 200, 1),
+                (2, 200, 2),
+                (2, 200, 3),
+            ]
         );
     }
 
@@ -2940,8 +3254,7 @@ mod tests {
                 },
             );
             // Set an oversized print area; it should be ignored in favor of tight content bounds.
-            ws.print.print_area =
-                Some(RangeRef::new(CellRef::new(0, 0), CellRef::new(500, 25)));
+            ws.print.print_area = Some(RangeRef::new(CellRef::new(0, 0), CellRef::new(500, 25)));
         }
         std::fs::write(
             &xlsx_path,

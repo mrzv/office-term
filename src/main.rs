@@ -56,7 +56,8 @@ fn main() -> ExitCode {
             let socket = config
                 .forward_socket()
                 .ok_or("forward_socket is disabled")?;
-            officeterm::ipc::screenshot(socket, path)?;
+            let path = std::path::absolute(path)?;
+            officeterm::ipc::screenshot(socket, &path)?;
             Ok(())
         })();
         return match result {

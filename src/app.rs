@@ -1117,7 +1117,7 @@ impl App {
             let tab = self.tab();
             (tab.document_id, tab.page_count)
         };
-        self.tab_mut().search = SearchState {
+        self.tab_mut().replace_search(SearchState {
             query: query.clone(),
             request_id,
             matches: Vec::new(),
@@ -1125,7 +1125,7 @@ impl App {
             scanned: 0,
             total_pages,
             searching: true,
-        };
+        });
         let _ = self.worker.search(document_id, request_id, query);
         self.search_picker = Some(SearchPickerState::new(self.tab().page));
         self.open_search_picker(output)
@@ -1188,6 +1188,7 @@ impl App {
         search.total_occurrences = total_occurrences;
         search.scanned = search.total_pages;
         search.searching = false;
+        self.session.tabs[index].retain_search_frames();
 
         if index == self.session.active_tab {
             if let Some(state) = &mut self.search_picker {
@@ -1291,7 +1292,7 @@ impl App {
         if self.search_picker.is_some() {
             self.close_search_picker(output)?;
         }
-        self.tab_mut().search = SearchState::default();
+        self.tab_mut().replace_search(SearchState::default());
         self.request_current(output)?;
         Ok(true)
     }
@@ -2921,7 +2922,10 @@ impl App {
         }
         let index = self.tab_index(frame.key.document_id)?;
         let tab = &self.session.tabs[index];
-        if frame.key.page >= tab.page_count || frame.revision != tab.revision {
+        if frame.key.page >= tab.page_count
+            || frame.revision != tab.revision
+            || frame.key.search_request_id != tab.search.highlight_request_id(frame.key.page)
+        {
             return None;
         }
         let key = frame.key;
@@ -2949,8 +2953,11 @@ impl App {
         self.session.tabs[index]
             .cache
             .insert(key, Arc::clone(&frame));
-        self.session.tabs[index].cache.retain(|cached, _| {
-            cached.width == key.width
+        let tab = &mut self.session.tabs[index];
+        let search = &tab.search;
+        tab.cache.retain(|cached, _| {
+            cached.search_request_id == search.highlight_request_id(cached.page)
+                && cached.width == key.width
                 && cached.height == key.height
                 && cached.zoom == key.zoom
                 && cached.fit == key.fit
@@ -3219,9 +3226,10 @@ impl App {
                 // its image until the replacement arrives, but only for this
                 // document revision and exact render settings. Run placement
                 // normally so scrolling still updates crops and removes pages.
-                let Some(old) = old_pages.iter().find(|old| {
-                    old.frame.key == key && old.frame.revision == self.tab().revision
-                }) else {
+                let Some(old) = old_pages
+                    .iter()
+                    .find(|old| old.frame.key == key && old.frame.revision == self.tab().revision)
+                else {
                     break;
                 };
                 Arc::clone(&old.frame)
@@ -3529,8 +3537,11 @@ impl App {
         if self.session.tabs.len() < 2 {
             return Ok(());
         }
+        self.draw_tab_bar_at_width(output, usize::from(crossterm::terminal::size()?.0))
+    }
+
+    fn draw_tab_bar_at_width(&self, output: &mut impl Write, columns: usize) -> io::Result<()> {
         let theme = self.theme;
-        let columns = usize::from(crossterm::terminal::size()?.0);
         execute!(
             output,
             MoveTo(0, 0),
@@ -3538,16 +3549,14 @@ impl App {
             SetForegroundColor(theme.dark3),
             Clear(ClearType::CurrentLine)
         )?;
-        let mut used = 0;
+        let remaining = Cell::new(columns);
         for (index, tab) in self.session.tabs.iter().enumerate() {
             let name = tab
                 .path
                 .file_name()
                 .map(|name| name.to_string_lossy())
                 .unwrap_or_else(|| tab.path.to_string_lossy());
-            let label = format!(" {}:{} ", index + 1, name);
-            let label: String = label.chars().take(columns.saturating_sub(used)).collect();
-            if label.is_empty() {
+            if remaining.get() == 0 {
                 break;
             }
             if index == self.session.active_tab {
@@ -3556,7 +3565,10 @@ impl App {
                     SetBackgroundColor(theme.blue),
                     SetForegroundColor(theme.bg_dark),
                     SetAttribute(Attribute::Bold),
-                    Print(&label),
+                    Print(StatusText(
+                        format_args!(" {}:{} ", index + 1, name),
+                        &remaining
+                    )),
                     SetAttribute(Attribute::NormalIntensity)
                 )?;
             } else {
@@ -3564,10 +3576,12 @@ impl App {
                     output,
                     SetBackgroundColor(theme.bg),
                     SetForegroundColor(theme.dark3),
-                    Print(&label)
+                    Print(StatusText(
+                        format_args!(" {}:{} ", index + 1, name),
+                        &remaining
+                    ))
                 )?;
             }
-            used += label.chars().count();
         }
         execute!(
             output,
@@ -6277,6 +6291,96 @@ mod tests {
         })
     }
 
+    #[test]
+    fn tab_basenames_cannot_emit_filename_controls() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (mut app, _, _file) = continuous_app();
+        let (mut other, _, _other_file) = continuous_app();
+        app.session.tabs.push(other.session.tabs.remove(0));
+        let mut bytes = b"old\x1b]52;c;owned\x07\n\r\t\x7f".to_vec();
+        bytes.extend_from_slice("\u{85}界".as_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(b".pptx");
+        let name = std::ffi::OsString::from_vec(bytes);
+        app.session.tabs[0].path = std::path::PathBuf::from(&name);
+        app.session.tabs[1].path = std::path::PathBuf::from(&name);
+        let safe: String = name
+            .to_string_lossy()
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        for columns in [0, 8, 36, 120] {
+            let mut actual = Vec::new();
+            app.draw_tab_bar_at_width(&mut actual, columns).unwrap();
+            for tab in &mut app.session.tabs {
+                tab.path = std::path::PathBuf::from(&safe);
+            }
+            let mut expected = Vec::new();
+            app.draw_tab_bar_at_width(&mut expected, columns).unwrap();
+            assert_eq!(actual, expected);
+            for tab in &mut app.session.tabs {
+                tab.path = std::path::PathBuf::from(&name);
+            }
+        }
+    }
+
+    #[test]
+    fn search_replacement_completion_and_clear_evict_obsolete_frames_immediately() {
+        let (mut app, viewport, _file) = continuous_app();
+        let document_id = app.tab().document_id;
+        let revision = app.tab().revision;
+        let plain_neighbor = app.page_key(1, viewport);
+        app.tab_mut().cache.insert(
+            plain_neighbor,
+            continuous_frame(plain_neighbor, revision, false),
+        );
+        for request_id in 1..=8 {
+            app.tab_mut().replace_search(super::SearchState {
+                query: format!("query {request_id}"),
+                request_id,
+                total_pages: 2,
+                searching: true,
+                ..Default::default()
+            });
+            assert!(app.tab().cache.keys().all(|key| key.search_request_id == 0));
+            app.apply_search_results(
+                document_id,
+                request_id,
+                vec![SearchPageMatch {
+                    page: 0,
+                    occurrences: 1,
+                    context: "match".into(),
+                }],
+                1,
+            )
+            .unwrap();
+            let highlighted = app.page_key(0, viewport);
+            assert_eq!(highlighted.search_request_id, request_id);
+            assert!(
+                app.store_frame((*continuous_frame(highlighted, revision, true)).clone())
+                    .is_some()
+            );
+            let wrong_neighbor = crate::pptx::RenderKey {
+                page: 1,
+                ..highlighted
+            };
+            assert!(
+                app.store_frame((*continuous_frame(wrong_neighbor, revision, true)).clone())
+                    .is_none()
+            );
+            assert_eq!(app.tab().cache.len(), 2);
+        }
+        let highlighted = app.page_key(0, viewport);
+        app.tab_mut().replace_search(super::SearchState::default());
+        assert_eq!(app.tab().cache.len(), 1);
+        assert!(app.tab().cache.contains_key(&plain_neighbor));
+        assert!(
+            app.store_frame((*continuous_frame(highlighted, revision, true)).clone())
+                .is_none()
+        );
+    }
+
     fn continuous_app() -> (super::App, Viewport, tempfile::NamedTempFile) {
         let file = tempfile::NamedTempFile::new().unwrap();
         let revision = crate::pptx::DocumentRevision::read(file.path()).unwrap();
@@ -8699,10 +8803,7 @@ mod tests {
             content: "copied slide text".to_string(),
         })
         .expect("text message should succeed");
-        assert_eq!(
-            app.pending_clipboard.as_deref(),
-            Some("copied slide text")
-        );
+        assert_eq!(app.pending_clipboard.as_deref(), Some("copied slide text"));
 
         let mut output = Vec::new();
         app.flush_pending_clipboard(&mut output)

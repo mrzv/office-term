@@ -30,6 +30,7 @@ use crate::pptx::{
 const PX_TO_PT: f32 = 0.75;
 const PAD_PX: f32 = 2.0;
 const DENSE_BLOCK: u64 = 4_000;
+const MAX_WRAP_LINES: usize = 2_000;
 
 type Rgb = [u8; 3];
 type CachedPixmap = (Arc<Pixmap>, u32, u32);
@@ -41,7 +42,10 @@ fn layout_k(lay: &SheetLayout) -> f32 {
 
 fn layout_avail(lay: &SheetLayout) -> (f32, f32) {
     let [l, r, t, b, ..] = lay.margins;
-    ((lay.page_w - l - r).max(36.0), (lay.page_h - t - b).max(36.0))
+    (
+        (lay.page_w - l - r).max(36.0),
+        (lay.page_h - t - b).max(36.0),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -207,7 +211,12 @@ impl ExcelDocument {
         self.pages
             .get(page)
             .and_then(|spec| self.layouts.get(spec.layout_idx))
-            .map(|lay| (f64::from(lay.page_w.max(1.0)), f64::from(lay.page_h.max(1.0))))
+            .map(|lay| {
+                (
+                    f64::from(lay.page_w.max(1.0)),
+                    f64::from(lay.page_h.max(1.0)),
+                )
+            })
             .unwrap_or((792.0, 612.0))
     }
 
@@ -340,7 +349,13 @@ impl ExcelDocument {
             let mut x = ox + lay.heading_w * k;
             for (csi, cs) in csegs.iter().enumerate() {
                 let b = make_block(&self.workbook, lay.sheet, sh, *rs, *cs, x, y, lay);
-                draw_block(&mut pg, &b, lay.settings.gridlines, &mut cf, &mut image_cache);
+                draw_block(
+                    &mut pg,
+                    &b,
+                    lay.settings.gridlines,
+                    &mut cf,
+                    &mut image_cache,
+                );
                 if lay.settings.headings {
                     draw_headings(
                         &mut pg,
@@ -454,13 +469,15 @@ impl ExcelDocument {
         let mut raw = String::new();
         let mut char_rects: Vec<Option<KurboRect>> = Vec::new();
 
-        let push_str =
-            |raw: &mut String, rects: &mut Vec<Option<KurboRect>>, s: &str, r: Option<KurboRect>| {
-                for ch in s.chars() {
-                    raw.push(ch);
-                    rects.push(r);
-                }
-            };
+        let push_str = |raw: &mut String,
+                        rects: &mut Vec<Option<KurboRect>>,
+                        s: &str,
+                        r: Option<KurboRect>| {
+            for ch in s.chars() {
+                raw.push(ch);
+                rects.push(r);
+            }
+        };
 
         if !sh.name.trim().is_empty() {
             push_str(&mut raw, &mut char_rects, sh.name.trim(), None);
@@ -629,8 +646,7 @@ impl ExcelDocument {
             y += seg_size(sh, *rs, true) * k;
         }
 
-        let mut placed_cells: Vec<(usize, u32, usize, u32, String, Option<KurboRect>)> =
-            Vec::new();
+        let mut placed_cells: Vec<(usize, u32, usize, u32, String, Option<KurboRect>)> = Vec::new();
         for (rsi, csi, b) in &blocks {
             let block_range = b.range();
             let cells: Vec<CellRef> = if block_range.count() <= DENSE_BLOCK {
@@ -755,10 +771,7 @@ impl ExcelDocument {
     fn resolve_internal_ref(&self, current_sheet: usize, target: &str) -> Option<(usize, CellRef)> {
         let t = target.trim().trim_start_matches('#');
         if let Some((sheet_part, ref_part)) = t.rsplit_once('!') {
-            let sheet_name = sheet_part
-                .trim()
-                .trim_matches('\'')
-                .replace("''", "'");
+            let sheet_name = sheet_part.trim().trim_matches('\'').replace("''", "'");
             let sheet_idx = self.workbook.sheet_index(&sheet_name)?;
             let cell = parse_first_cell(ref_part)?;
             return Some((sheet_idx, cell));
@@ -766,27 +779,10 @@ impl ExcelDocument {
         if let Some(cell) = parse_first_cell(t) {
             return Some((current_sheet, cell));
         }
-        let lower = t.to_ascii_lowercase();
-        let dn = self
-            .workbook
-            .names
-            .iter()
-            .find(|n| {
-                n.name.to_ascii_lowercase() == lower
-                    && (n.scope.is_none() || n.scope == Some(current_sheet))
-            })
-            .or_else(|| {
-                self.workbook
-                    .names
-                    .iter()
-                    .find(|n| n.name.to_ascii_lowercase() == lower)
-            })?;
+        let dn = self.workbook.name(t, current_sheet)?;
         let formula = dn.formula.trim().trim_start_matches('=');
         if let Some((sheet_part, ref_part)) = formula.rsplit_once('!') {
-            let sheet_name = sheet_part
-                .trim()
-                .trim_matches('\'')
-                .replace("''", "'");
+            let sheet_name = sheet_part.trim().trim_matches('\'').replace("''", "'");
             let sheet_idx = self.workbook.sheet_index(&sheet_name)?;
             let cell = parse_first_cell(ref_part)?;
             return Some((sheet_idx, cell));
@@ -854,7 +850,11 @@ fn cell_has_direct_content(sh: &Sheet, c: CellRef) -> bool {
     if sh.cell_pictures.get(&c).is_some_and(|p| !p.data.is_empty()) {
         return true;
     }
-    if sh.comments.get(&c).is_some_and(|cm| !cm.text.trim().is_empty()) {
+    if sh
+        .comments
+        .get(&c)
+        .is_some_and(|cm| !cm.text.trim().is_empty())
+    {
         return true;
     }
     if sh.hyperlinks.contains_key(&c) {
@@ -1105,18 +1105,21 @@ fn measure_text_width(font: FontSpec<'_>, size: f32, text: &str) -> f32 {
     let db = FontDb::global();
     let mut width = 0.0f64;
     for ch in text.chars() {
-        let mut face = base_face;
-        let mut gid = face.glyph_for(ch);
-        if gid == 0
-            && let Some(fb) = db.fallback_for(ch, face.id())
-        {
-            face = FaceRef::of(&fb);
-            gid = face.glyph_for(ch);
-        }
-        let k = f64::from(size) / face.upem.max(1.0);
-        width += face.advance(gid) * k;
+        width += char_advance(base_face, db, size, ch);
     }
     width as f32
+}
+
+fn char_advance(base_face: FaceRef, db: &FontDb, size: f32, ch: char) -> f64 {
+    let mut face = base_face;
+    let mut gid = face.glyph_for(ch);
+    if gid == 0
+        && let Some(fb) = db.fallback_for(ch, face.id())
+    {
+        face = FaceRef::of(&fb);
+        gid = face.glyph_for(ch);
+    }
+    face.advance(gid) * (f64::from(size) / face.upem.max(1.0))
 }
 
 struct ChartMeasure;
@@ -1210,7 +1213,8 @@ impl PageCanvas {
         self.ctx.set_transform(self.view);
         self.ctx
             .set_paint(peniko::Color::from_rgba8(rgb[0], rgb[1], rgb[2], 255));
-        self.ctx.set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
+        self.ctx
+            .set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
         self.ctx.stroke_rect(&r);
     }
 
@@ -1292,7 +1296,8 @@ impl PageCanvas {
         if let Some((c, lw)) = stroke {
             self.ctx
                 .set_paint(peniko::Color::from_rgba8(c[0], c[1], c[2], 255));
-            self.ctx.set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
+            self.ctx
+                .set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
             self.ctx.stroke_path(&p);
         }
     }
@@ -1311,7 +1316,8 @@ impl PageCanvas {
         if let Some((c, lw)) = stroke {
             self.ctx
                 .set_paint(peniko::Color::from_rgba8(c[0], c[1], c[2], 255));
-            self.ctx.set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
+            self.ctx
+                .set_stroke(kurbo::Stroke::new(f64::from(lw.max(0.1))));
             self.ctx.stroke_path(&circle);
         }
     }
@@ -1334,8 +1340,9 @@ impl PageCanvas {
             image: vello_cpu::ImageSource::Pixmap(pm),
             sampler: peniko::ImageSampler::default().with_quality(peniko::ImageQuality::Medium),
         });
-        self.ctx
-            .set_paint_transform(Affine::translate((r.x0, r.y0)) * Affine::scale_non_uniform(sx, sy));
+        self.ctx.set_paint_transform(
+            Affine::translate((r.x0, r.y0)) * Affine::scale_non_uniform(sx, sy),
+        );
         self.ctx.fill_rect(&r);
         self.ctx.reset_paint_transform();
     }
@@ -1392,8 +1399,7 @@ impl PageCanvas {
                 );
                 self.ctx.fill_path(&outline);
                 if resolved.synth_bold {
-                    self.ctx
-                        .set_stroke(kurbo::Stroke::new(face.upem * 0.03));
+                    self.ctx.set_stroke(kurbo::Stroke::new(face.upem * 0.03));
                     self.ctx.stroke_path(&outline);
                 }
             }
@@ -1687,44 +1693,51 @@ fn draw_prims(pg: &mut PageCanvas, prims: &[gridcraft_chart::Prim], xf: Xf) {
 
 fn wrap_lines(text: &str, font: FontSpec<'_>, size: f32, width: f32) -> Vec<String> {
     let mut out = Vec::new();
+    let face = resolve_face(font).face;
+    let db = FontDb::global();
+    let advance = |ch| {
+        if size.is_finite() && size > 0.0 {
+            char_advance(face, db, size, ch)
+        } else {
+            0.0
+        }
+    };
+    let space_width = advance(' ');
     for para in text.split('\n') {
         let mut line = String::new();
+        let mut line_width = 0.0;
         for word in para.split(' ') {
-            let cand = if line.is_empty() {
-                word.to_string()
-            } else {
-                format!("{line} {word}")
-            };
-            if line.is_empty() || measure_text_width(font, size, &cand) <= width {
-                line = cand;
-            } else {
+            let word_width: f64 = word.chars().map(&advance).sum();
+            if !line.is_empty() {
+                if (line_width + space_width + word_width) as f32 <= width {
+                    line.push(' ');
+                    line.push_str(word);
+                    line_width += space_width + word_width;
+                    continue;
+                }
                 out.push(std::mem::take(&mut line));
-                line = word.to_string();
+                if out.len() == MAX_WRAP_LINES {
+                    return out;
+                }
+                line_width = 0.0;
             }
-            while measure_text_width(font, size, &line) > width && line.chars().count() > 1 {
-                let mut cut = String::new();
-                let mut rest = String::new();
-                for ch in line.chars() {
-                    if (rest.is_empty()
-                        && measure_text_width(font, size, &format!("{cut}{ch}")) <= width)
-                        || cut.is_empty()
-                    {
-                        cut.push(ch);
-                    } else {
-                        rest.push(ch);
+            for ch in word.chars() {
+                let char_width = advance(ch);
+                if !line.is_empty() && (line_width + char_width) as f32 > width {
+                    out.push(std::mem::take(&mut line));
+                    if out.len() == MAX_WRAP_LINES {
+                        return out;
                     }
+                    line_width = 0.0;
                 }
-                if rest.is_empty() {
-                    break;
-                }
-                out.push(cut);
-                line = rest;
-            }
-            if out.len() > 2000 {
-                return out;
+                line.push(ch);
+                line_width += char_width;
             }
         }
         out.push(line);
+        if out.len() == MAX_WRAP_LINES {
+            return out;
+        }
     }
     out
 }
@@ -1839,6 +1852,78 @@ fn font_for(style: &Style) -> FontSpec<'_> {
     }
 }
 
+fn block_cells(wb: &Workbook, sh: &Sheet, block: RangeRef) -> Vec<CellRef> {
+    if block.count() <= DENSE_BLOCK {
+        return block.iter().collect();
+    }
+    let mut cells: Vec<CellRef> = sh.cells.iter_range(block).map(|(c, _)| c).collect();
+    cells.extend(
+        sh.spill
+            .range(block.start..=block.end)
+            .map(|(c, _)| *c)
+            .filter(|c| block.contains(*c)),
+    );
+    cells.extend(
+        sh.cell_pictures
+            .keys()
+            .copied()
+            .filter(|c| block.contains(*c)),
+    );
+    let paints_blank = |style: &Style| {
+        style.fill.pattern != PatternType::None || style.borders != Borders::default()
+    };
+    let visible_style = |id| paints_blank(wb.styles.get(id));
+    // Only expand formatting sources intersecting this block, not its unstyled grid.
+    let mut add_range = |range: RangeRef| {
+        if let Some(range) = range.intersection(&block) {
+            cells.extend(range.iter());
+        }
+    };
+    for (&row, info) in sh.rows.range(block.start.row..=block.end.row) {
+        if info.style.is_some_and(&visible_style) {
+            add_range(RangeRef::new(
+                CellRef::new(row, block.start.col),
+                CellRef::new(row, block.end.col),
+            ));
+        }
+    }
+    for (&col, info) in sh.cols.range(block.start.col..=block.end.col) {
+        if info.style.is_some_and(&visible_style) {
+            add_range(RangeRef::new(
+                CellRef::new(block.start.row, col),
+                CellRef::new(block.end.row, col),
+            ));
+        }
+    }
+    for format in &sh.cond_formats {
+        use gridcraft_engine::model::CfRule;
+        let style = match &format.rule {
+            CfRule::CellIs { style, .. }
+            | CfRule::Expression { style, .. }
+            | CfRule::ContainsText { style, .. }
+            | CfRule::NotContainsText { style, .. }
+            | CfRule::BeginsWith { style, .. }
+            | CfRule::EndsWith { style, .. }
+            | CfRule::Blanks { style }
+            | CfRule::NoErrors { style } => Some(style),
+            // The remaining rules cannot paint an unstored blank.
+            _ => None,
+        };
+        if !style.is_some_and(|style| paints_blank(style)) {
+            continue;
+        }
+        for &range in &format.ranges {
+            add_range(range);
+        }
+    }
+    for table in &sh.tables {
+        add_range(table.range);
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    cells
+}
+
 fn draw_block(
     pg: &mut PageCanvas,
     b: &Block<'_>,
@@ -1866,27 +1951,8 @@ fn draw_block(
         .copied()
         .collect();
     let covered = |c: CellRef| merges.iter().any(|m| m.contains(c));
-    let cells: Vec<CellRef> = if block.count() <= DENSE_BLOCK {
-        block.iter().filter(|c| !covered(*c)).collect()
-    } else {
-        let mut set: Vec<CellRef> = sh.cells.iter_range(block).map(|(c, _)| c).collect();
-        set.extend(
-            sh.spill
-                .range(block.start..=block.end)
-                .map(|(c, _)| *c)
-                .filter(|c| block.contains(*c)),
-        );
-        set.extend(
-            sh.cell_pictures
-                .keys()
-                .copied()
-                .filter(|c| block.contains(*c)),
-        );
-        set.sort_unstable();
-        set.dedup();
-        set.retain(|c| !covered(*c));
-        set
-    };
+    let mut cells = block_cells(b.wb, sh, block);
+    cells.retain(|c| !covered(*c));
     pg.push_clip(bx, by, bw, bh);
     if gridlines {
         let grey = [0xB0, 0xB0, 0xB0];
@@ -1965,13 +2031,11 @@ fn draw_block(
         let bd = &l.style.borders;
         let (right, bottom) = match merges.iter().find(|m| m.start == *c).filter(|_| merged) {
             Some(m) => (
-                b.wb
-                    .styles
+                b.wb.styles
                     .get(sh.style_id(CellRef::new(m.start.row, m.end.col)))
                     .borders
                     .right,
-                b.wb
-                    .styles
+                b.wb.styles
                     .get(sh.style_id(CellRef::new(m.end.row, m.start.col)))
                     .borders
                     .bottom,
@@ -2096,8 +2160,7 @@ fn draw_text(
     {
         let digit = measure_text_width(font, size, "0").max(0.1);
         let max_chars = (avail / digit).floor().max(1.0) as usize;
-        format_general_fit(n, max_chars.min(11))
-            .unwrap_or_else(|| "#".repeat(max_chars.min(255)))
+        format_general_fit(n, max_chars.min(11)).unwrap_or_else(|| "#".repeat(max_chars.min(255)))
     } else {
         gridcraft_engine::display::value_text_as(wb, &v, code)
     };
@@ -2135,9 +2198,7 @@ fn draw_text(
     let rotated = rot != 0 && rot != 255;
     let lines: Vec<String> = match (wrap, rotated) {
         (true, false) => wrap_lines(&text, font, size, avail.max(size)),
-        (true, true) if rot.abs() == 90 => {
-            wrap_lines(&text, font, size, (h - 2.0 * pad).max(size))
-        }
+        (true, true) if rot.abs() == 90 => wrap_lines(&text, font, size, (h - 2.0 * pad).max(size)),
         (true, true) => vec![text.lines().next().unwrap_or_default().to_string()],
         (false, _) => vec![text],
     };
@@ -2386,7 +2447,15 @@ fn draw_objects(
             wpx,
             hpx,
         );
-        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
+        draw_prims(
+            pg,
+            &prims,
+            Xf {
+                ox: x,
+                oy: y,
+                k: b.k,
+            },
+        );
     }
     for im in &sh.images {
         let r = anchor_rect(sh, &im.anchor);
@@ -2430,12 +2499,8 @@ fn draw_objects(
                 if shp.kind == ShapeKind::Arrow {
                     let ang = h.atan2(w);
                     let al = 8.0 * b.k;
-                    let p = |da: f32| {
-                        [
-                            x + w - al * (ang + da).cos(),
-                            y + h - al * (ang + da).sin(),
-                        ]
-                    };
+                    let p =
+                        |da: f32| [x + w - al * (ang + da).cos(), y + h - al * (ang + da).sin()];
                     pg.polygon(&[[x + w, y + h], p(0.4), p(-0.4)], Some(c), None);
                 }
             }
@@ -2497,7 +2562,15 @@ fn draw_objects(
         let (x, y, _, _) = place(r);
         let data = gridcraft_chart::resolve(wb, si, ch);
         let prims = gridcraft_chart::render(ch, &data, r.2 as f32, r.3 as f32, &ChartMeasure);
-        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
+        draw_prims(
+            pg,
+            &prims,
+            Xf {
+                ox: x,
+                oy: y,
+                k: b.k,
+            },
+        );
     }
     pg.pop_clip();
 }
@@ -2661,6 +2734,231 @@ fn seg_size(sh: &Sheet, seg: (u32, u32), rows: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_blank_formatting_matches_dense_rendering() {
+        use gridcraft_engine::model::{CfRule, CondFormat, Fill, LineInfo, Table};
+
+        let mut wb = Workbook::new();
+        let mut row_style = Style::default();
+        row_style.fill = Fill::solid(Color::rgb(20, 40, 200));
+        row_style.borders.bottom = BorderLine::thin();
+        let row_style = wb.styles.intern(row_style);
+        let mut col_style = Style::default();
+        col_style.fill = Fill::solid(Color::rgb(20, 180, 40));
+        let col_style = wb.styles.intern(col_style);
+        let mut border_style = Style::default();
+        border_style.borders.left = BorderLine::thin();
+        let border_style = wb.styles.intern(border_style);
+        let mut cf_style = Style::default();
+        cf_style.fill = Fill::solid(Color::rgb(200, 40, 20));
+        {
+            let sh = Arc::make_mut(&mut wb.sheets[0]);
+            sh.default_col_width = 4.0;
+            sh.default_row_height = 4.0;
+            sh.rows.insert(
+                10,
+                LineInfo {
+                    style: Some(row_style),
+                    ..Default::default()
+                },
+            );
+            sh.cols.insert(
+                20,
+                LineInfo {
+                    style: Some(border_style),
+                    ..Default::default()
+                },
+            );
+            sh.cols.insert(
+                21,
+                LineInfo {
+                    style: Some(col_style),
+                    ..Default::default()
+                },
+            );
+            sh.cond_formats.push(CondFormat {
+                ranges: vec![RangeRef::new(CellRef::new(30, 30), CellRef::new(34, 34))],
+                rule: CfRule::Blanks {
+                    style: Box::new(cf_style),
+                },
+                priority: 1,
+                stop_if_true: false,
+            });
+            sh.tables.push(Table {
+                id: 1,
+                name: "BlankTable".into(),
+                range: RangeRef::new(CellRef::new(35, 5), CellRef::new(40, 8)),
+                header_row: true,
+                totals_row: false,
+                columns: Vec::new(),
+                style: "TableStyleMedium2".into(),
+                banded_rows: true,
+                banded_cols: false,
+                first_col: false,
+                last_col: false,
+                filter_button: false,
+                filter: Vec::new(),
+                table_type: None,
+                connection_id: None,
+            });
+        }
+        let area = RangeRef::new(CellRef::new(0, 0), CellRef::new(99, 99));
+        let mut lay = layout_sheet(&wb, 0, &PrintOptions::default(), Some(area)).unwrap();
+        lay.scale = 1.0;
+        let sh = &wb.sheets[0];
+        // Compare an interior viewport: border end caps at the different block edges
+        // otherwise legitimately rasterize differently.
+        const VIEW_SIZE: usize = 147;
+        assert!(sh.cells.is_empty());
+        let render = |end, gridlines| {
+            let b = make_block(&wb, 0, sh, (0, end), (0, end), 0.0, 0.0, &lay);
+            let mut pg = PageCanvas::new(VIEW_SIZE as u16, VIEW_SIZE as u16, Affine::IDENTITY);
+            draw_block(
+                &mut pg,
+                &b,
+                gridlines,
+                &mut Some(CfCache::new()),
+                &mut ImageCache::new(),
+            );
+            pg.finish()
+        };
+        for gridlines in [false, true] {
+            let dense = render(49, gridlines);
+            let sparse = render(99, gridlines);
+            assert!(
+                sparse == dense,
+                "dense and sparse interior pixels differ, gridlines: {gridlines}"
+            );
+            for (x, y, rgb) in [
+                (4, 31, [20, 40, 200]),
+                (64, 4, [20, 180, 40]),
+                (91, 91, [200, 40, 20]),
+            ] {
+                let offset = (y * VIEW_SIZE + x) * 4;
+                assert_eq!(&sparse[offset..offset + 3], &rgb);
+            }
+            assert_eq!(
+                sparse[(106 * VIEW_SIZE + 16) * 4 + 3],
+                255,
+                "blank table header"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_unstyled_blocks_remain_sparse() {
+        use gridcraft_engine::core::MAX_ROWS;
+        use gridcraft_engine::model::{CfRule, CondFormat, LineInfo};
+
+        let mut wb = Workbook::new();
+        let font_only = wb
+            .styles
+            .derive(StyleId::DEFAULT, |style| style.font.bold = true);
+        let font_style = wb.styles.get(font_only).clone();
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        sh.rows.insert(
+            0,
+            LineInfo {
+                style: Some(font_only),
+                ..Default::default()
+            },
+        );
+        let cell = CellRef::new(5, 7);
+        sh.set_value(cell, Value::from("stored"));
+        let area = RangeRef::new(CellRef::new(0, 0), CellRef::new(MAX_ROWS - 1, MAX_COLS - 1));
+        sh.cond_formats.push(CondFormat {
+            ranges: vec![area],
+            rule: CfRule::Expression {
+                formula: "TRUE".into(),
+                style: Box::new(font_style),
+            },
+            priority: 1,
+            stop_if_true: false,
+        });
+        assert_eq!(block_cells(&wb, &wb.sheets[0], area), vec![cell]);
+    }
+
+    #[test]
+    fn internal_names_prefer_current_sheet_and_reject_other_local_scopes() {
+        use gridcraft_engine::model::DefinedName;
+
+        let mut wb = Workbook::new();
+        wb.sheets.push(Arc::new(Sheet::new("Other")));
+        let name = |name: &str, scope, formula: &str| DefinedName {
+            name: name.into(),
+            scope,
+            formula: formula.into(),
+            comment: String::new(),
+            hidden: false,
+        };
+        wb.names = vec![
+            name("Jump", None, "$A$1"),
+            name("Jump", Some(0), "$C$3"),
+            name("Jump", Some(1), "$D$4"),
+            name("OtherOnly", Some(1), "$E$5"),
+            name("GlobalOnly", None, "'Other'!$B$2"),
+        ];
+        let mut doc = ExcelDocument {
+            workbook: wb,
+            layouts: Vec::new(),
+            pages: Vec::new(),
+            meta_cache: Vec::new(),
+            image_cache: RefCell::new(HashMap::new()),
+            file_name: "names.xlsx".into(),
+            file_path: "names.xlsx".into(),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                doc.resolve_internal_ref(0, "#jUmP"),
+                Some((0, CellRef::new(2, 2)))
+            );
+            assert_eq!(
+                doc.resolve_internal_ref(1, "Jump"),
+                Some((1, CellRef::new(3, 3)))
+            );
+            assert_eq!(doc.resolve_internal_ref(0, "OtherOnly"), None);
+            assert_eq!(
+                doc.resolve_internal_ref(1, "OtherOnly"),
+                Some((1, CellRef::new(4, 4)))
+            );
+            assert_eq!(
+                doc.resolve_internal_ref(0, "GlobalOnly"),
+                Some((1, CellRef::new(1, 1)))
+            );
+            doc.workbook.names.reverse();
+        }
+        doc.workbook.names.retain(|name| name.scope != Some(0));
+        assert_eq!(
+            doc.resolve_internal_ref(0, "Jump"),
+            Some((0, CellRef::new(0, 0)))
+        );
+    }
+
+    #[test]
+    fn long_word_wrapping_caps_lines_and_preserves_character_boundaries() {
+        let font = FontSpec::SANS;
+        let size = 11.0;
+        let one = measure_text_width(font, size, "W");
+        let lines = wrap_lines(&"W".repeat(32_767), font, size, one * 0.5);
+        assert_eq!(lines.len(), MAX_WRAP_LINES);
+        assert!(lines.iter().all(|line| line == "W"));
+        let width = measure_text_width(font, size, "éé");
+        assert_eq!(wrap_lines("ééééé", font, size, width), ["éé", "éé", "é"]);
+        let width = measure_text_width(font, size, "one two");
+        assert_eq!(
+            wrap_lines("one two three", font, size, width),
+            ["one two", "three"]
+        );
+        assert_eq!(
+            wrap_lines("one  two\n\nthree", font, size, 1_000.0),
+            ["one  two", "", "three"]
+        );
+        assert_eq!(
+            wrap_lines(&"\n".repeat(32_767), font, size, width).len(),
+            MAX_WRAP_LINES
+        );
+    }
 
     #[test]
     fn repeated_title_rows_and_cols_appear_in_subsequent_page_text_and_bboxes() {
