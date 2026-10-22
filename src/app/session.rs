@@ -207,7 +207,7 @@ impl App {
                 tab.watcher.accept(fingerprint);
                 tab.revision = revision;
                 tab.page_count = pages;
-                tab.page = tab.page.min(pages - 1);
+                tab.page = tab.page.min(pages.saturating_sub(1));
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();
@@ -256,7 +256,7 @@ impl App {
                 });
                 if let Some(view) = view {
                     let tab = self.session.tabs.last_mut().expect("new tab");
-                    tab.page = view.position.page.min(pages - 1);
+                    tab.page = view.position.page.min(pages.saturating_sub(1));
                     tab.scroll_x = view.position.scroll_x;
                     tab.scroll_y = view.position.scroll_y;
                     tab.fit = view.fit;
@@ -394,6 +394,7 @@ impl App {
         }
         self.clear_viewer(output)?;
         self.reset_render_state();
+        self.ensure_link_index();
         self.request_current(output)?;
         Ok(false)
     }

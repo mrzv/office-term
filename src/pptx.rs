@@ -611,8 +611,8 @@ struct PendingCommands {
     opens: VecDeque<(DocumentId, PathBuf)>,
     closes: VecDeque<DocumentId>,
     text_requests: VecDeque<(DocumentId, u32)>,
-    search: Option<(DocumentId, u64, String)>,
-    link_index: Option<(DocumentId, u64)>,
+    searches: VecDeque<(DocumentId, u64, String)>,
+    link_indices: VecDeque<(DocumentId, u64)>,
     shutdown: bool,
 }
 
@@ -624,8 +624,8 @@ impl PendingCommands {
             opens: VecDeque::new(),
             closes: VecDeque::new(),
             text_requests: VecDeque::new(),
-            search: None,
-            link_index: None,
+            searches: VecDeque::new(),
+            link_indices: VecDeque::new(),
             shutdown: false,
         }
     }
@@ -658,9 +658,16 @@ impl PendingCommands {
                 }
             }
             WorkerCommand::Open { document_id, path } => {
+                self.opens.retain(|(queued_id, _)| *queued_id != document_id);
                 self.opens.push_back((document_id, path));
             }
             WorkerCommand::Close { document_id } => {
+                self.renders.retain(|queued| queued.key.document_id != document_id);
+                self.prefetch.retain(|queued| queued.key.document_id != document_id);
+                self.opens.retain(|(queued_id, _)| *queued_id != document_id);
+                self.text_requests.retain(|(queued_id, _)| *queued_id != document_id);
+                self.searches.retain(|(queued_id, _, _)| *queued_id != document_id);
+                self.link_indices.retain(|(queued_id, _)| *queued_id != document_id);
                 self.closes.push_back(document_id);
             }
             WorkerCommand::ExtractText { document_id, page } => {
@@ -671,13 +678,15 @@ impl PendingCommands {
                 request_id,
                 query,
             } => {
-                self.search = Some((document_id, request_id, query));
+                self.searches.retain(|(queued_id, _, _)| *queued_id != document_id);
+                self.searches.push_back((document_id, request_id, query));
             }
             WorkerCommand::IndexLinks {
                 document_id,
                 request_id,
             } => {
-                self.link_index = Some((document_id, request_id));
+                self.link_indices.retain(|(queued_id, _)| *queued_id != document_id);
+                self.link_indices.push_back((document_id, request_id));
             }
             WorkerCommand::Shutdown => {
                 self.shutdown = true;
@@ -700,11 +709,13 @@ impl PendingCommands {
             && self.opens.is_empty()
             && self.closes.is_empty()
             && self.text_requests.is_empty()
-            && self.search.is_none()
-            && self.link_index.is_none()
+            && self.searches.is_empty()
+            && self.link_indices.is_empty()
             && !self.shutdown
     }
 }
+
+const MAX_DOCUMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 fn load_presentation_from_bytes(path: &Path, bytes: &[u8]) -> Result<Presentation, String> {
     if deckcraft_pptx::is_encrypted(bytes) {
@@ -724,13 +735,31 @@ fn load_presentation_from_bytes(path: &Path, bytes: &[u8]) -> Result<Presentatio
 }
 
 fn install_embedded_fonts(presentation: &Presentation) {
+    static INSTALLED_FONTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(u64, usize)>>,
+    > = std::sync::OnceLock::new();
+
+    if presentation.embedded_fonts.is_empty() {
+        return;
+    }
+    let installed =
+        INSTALLED_FONTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let font_db = FontDb::global();
     for embedded in &presentation.embedded_fonts {
         for media_id in embedded.faces().into_iter().flatten() {
             if let Some(item) = presentation.media(media_id)
                 && let Some(sfnt) = deckcraft_fonts::embedded_sfnt(&item.data)
             {
-                font_db.add_font(sfnt.to_owned());
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&sfnt, &mut hasher);
+                let hash = std::hash::Hasher::finish(&hasher);
+                let is_new = installed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((hash, sfnt.len()));
+                if is_new {
+                    font_db.add_font(sfnt.to_owned());
+                }
             }
         }
     }
@@ -741,13 +770,51 @@ fn open_presentation(
 ) -> Result<(OpenPresentation, u32, Vec<OutlineItem>, DocumentRevision), String> {
     let revision = DocumentRevision::read(path)
         .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if revision.len > MAX_DOCUMENT_FILE_BYTES {
+        return Err(format!(
+            "{} exceeds maximum supported file size (256 MiB)",
+            path.display()
+        ));
+    }
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+
+    let is_supported = matches!(
+        ext.as_str(),
+        "docx"
+            | "doc"
+            | "docm"
+            | "dotx"
+            | "dotm"
+            | "dot"
+            | "rtf"
+            | "odt"
+            | "xlsx"
+            | "xls"
+            | "xlsm"
+            | "xlsb"
+            | "xltx"
+            | "xltm"
+            | "xlt"
+            | "ods"
+            | "csv"
+            | "tsv"
+            | "pptx"
+            | "ppsx"
+            | "potx"
+            | "pptm"
+            | "ppsm"
+            | "potm"
+    );
+    if !is_supported {
+        return Err(format!("unsupported document format: {}", path.display()));
+    }
+
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
 
     let (backend, pages, outline) = match ext.as_str() {
         "docx" | "doc" | "docm" | "dotx" | "dotm" | "dot" | "rtf" | "odt" => {
@@ -758,13 +825,14 @@ fn open_presentation(
             let (excel, pages, outline) = crate::excel::ExcelDocument::load(path, &bytes)?;
             (DocumentBackend::Excel(Box::new(excel)), pages, outline)
         }
-        _ => {
+        "pptx" | "ppsx" | "potx" | "pptm" | "ppsm" | "potm" => {
             let presentation = load_presentation_from_bytes(path, &bytes)?;
             let pages = u32::try_from(presentation.slides.len())
                 .map_err(|_| "presentation has too many slides".to_string())?;
             let outline = collect_outline(&presentation);
             (DocumentBackend::Pptx(Box::new(presentation)), pages, outline)
         }
+        _ => unreachable!(),
     };
 
     let doc = OpenPresentation {
@@ -901,6 +969,9 @@ fn worker_loop(
             match open_presentation(&path) {
                 Ok((doc, pages, outline, revision)) => {
                     documents.insert(document_id, doc);
+                    if active_link_index.is_some_and(|active| active.document_id == document_id) {
+                        active_link_index = None;
+                    }
                     if messages
                         .send(WorkerMessage::Opened {
                             document_id,
@@ -942,7 +1013,7 @@ fn worker_loop(
             continue;
         }
 
-        if let Some((document_id, request_id, query)) = pending.search.take() {
+        if let Some((document_id, request_id, query)) = pending.searches.pop_front() {
             let Some(doc) = documents.get_mut(&document_id) else {
                 continue;
             };
@@ -1003,16 +1074,28 @@ fn worker_loop(
             continue;
         }
 
-        if let Some((document_id, request_id)) = pending.link_index.take()
-            && let Some(doc) = documents.get(&document_id)
-        {
-            active_link_index = Some(ActiveLinkIndex {
-                document_id,
-                request_id,
-                epoch: link_index_epoch.load(Ordering::Acquire),
-                next_page: 0,
-                total_pages: doc.pages,
-            });
+        if active_link_index.is_some_and(|active| {
+            pending
+                .link_indices
+                .iter()
+                .any(|(queued_id, _)| *queued_id == active.document_id)
+        }) {
+            active_link_index = None;
+        }
+
+        if active_link_index.is_none() {
+            while let Some((document_id, request_id)) = pending.link_indices.pop_front() {
+                if let Some(doc) = documents.get(&document_id) {
+                    active_link_index = Some(ActiveLinkIndex {
+                        document_id,
+                        request_id,
+                        epoch: link_index_epoch.load(Ordering::Acquire),
+                        next_page: 0,
+                        total_pages: doc.pages,
+                    });
+                    break;
+                }
+            }
         }
 
         if let Some(mut active) = active_link_index.take() {
@@ -1721,14 +1804,14 @@ fn index_slide_links(doc: &mut OpenPresentation, page: u32) -> Vec<DocumentLink>
     let Ok(slide_index) = usize::try_from(page) else {
         return Vec::new();
     };
-    let (index_height, links) = match &doc.backend {
+    let index_width = 1000u32;
+    let (index_height, scale, links) = match &doc.backend {
         DocumentBackend::Pptx(pres) => {
             if slide_index >= pres.slides.len() {
                 return Vec::new();
             }
             let slide_w = pres.slide_size.width.max(1.0);
             let slide_h = pres.slide_size.height.max(1.0);
-            let index_width = 1000u32;
             let index_height = ((f64::from(index_width) * slide_h / slide_w).round() as u32).max(1);
             let scale = f64::from(index_width) / slide_w;
             let placed = place_slide(pres, slide_index);
@@ -1740,41 +1823,57 @@ fn index_slide_links(doc: &mut OpenPresentation, page: u32) -> Vec<DocumentLink>
                 index_height,
                 scale,
             );
-            (index_height, links)
+            (index_height, scale, links)
         }
         DocumentBackend::Word(word) => {
             if slide_index >= word.page_count() {
                 return Vec::new();
             }
             let (page_w, page_h) = word.page_size(slide_index);
-            let index_width = 1000u32;
             let index_height = ((f64::from(index_width) * page_h / page_w).round() as u32).max(1);
             let scale = f64::from(index_width) / page_w;
             let links = word.extract_page_links(slide_index, index_width, index_height, scale);
-            (index_height, links)
+            (index_height, scale, links)
         }
         DocumentBackend::Excel(excel) => {
             if slide_index >= excel.page_count() {
                 return Vec::new();
             }
             let (page_w, page_h) = excel.page_size(slide_index);
-            let index_width = 1000u32;
             let index_height = ((f64::from(index_width) * page_h / page_w).round() as u32).max(1);
             let scale = f64::from(index_width) / page_w;
             let links = excel.extract_page_links(slide_index, index_width, index_height, scale);
-            (index_height, links)
+            (index_height, scale, links)
         }
     };
-    let source_text = cached_slide_text(doc, page).map(|text| normalize_context_text(&text.raw));
+    let cached = cached_slide_text(doc, page).cloned();
+    let indexed_context = cached
+        .as_ref()
+        .map(|text| normalize_context_with_indices(&text.raw));
     let mut label_occurrences = HashMap::<String, usize>::new();
+    let mut used_byte_starts = std::collections::HashSet::<usize>::new();
     links
         .into_iter()
         .enumerate()
         .map(|(ordinal, link)| {
             let occurrence = label_occurrences.entry(link.label.clone()).or_default();
-            let source_context = source_text
-                .as_deref()
-                .and_then(|text| context_around_label(text, &link.label, *occurrence, 90, 110));
+            let source_context = match (&cached, &indexed_context) {
+                (Some(cached_text), Some((norm_text, byte_to_char))) => context_around_link(
+                    norm_text,
+                    byte_to_char,
+                    &cached_text.char_rects,
+                    &link.rect,
+                    index_width,
+                    index_height,
+                    scale,
+                    &link.label,
+                    *occurrence,
+                    &mut used_byte_starts,
+                    90,
+                    110,
+                ),
+                _ => None,
+            };
             *occurrence += 1;
             DocumentLink {
                 source_page: page,
@@ -1815,9 +1914,22 @@ fn cached_slide_text(doc: &mut OpenPresentation, page: u32) -> Option<&CachedSli
                         raw.push('\n');
                         char_rects.push(None);
                     }
+                    let lines = &pt.layout.lines;
+                    let mut line_idx = 0usize;
                     for (char_idx, ch) in body_text.chars().enumerate() {
                         raw.push(ch);
-                        let rect = placed_text_span_bbox(pt, char_idx, char_idx + 1);
+                        while line_idx < lines.len()
+                            && lines[line_idx].span(char_idx, usize::MAX).is_none()
+                        {
+                            line_idx += 1;
+                        }
+                        let rect = lines
+                            .get(line_idx)
+                            .and_then(|line| {
+                                let (x0, x1) = line.span(char_idx, char_idx + 1)?;
+                                let local = KurboRect::new(x0, line.top, x1, line.bottom);
+                                Some(transform_rect_bbox(&pt.transform, local))
+                            });
                         char_rects.push(rect);
                     }
                 }
@@ -1923,7 +2035,13 @@ fn search_document(
 
     for page in 0..total {
         pending.drain(commands);
-        if pending.shutdown || pending.search.is_some() {
+        if pending.shutdown
+            || pending.closes.contains(&document_id)
+            || pending
+                .searches
+                .iter()
+                .any(|(queued_id, _, _)| *queued_id == document_id)
+        {
             return !pending.shutdown;
         }
         if let Some(cached) = cached_slide_text(doc, page) {
@@ -2058,10 +2176,41 @@ pub(crate) fn normalize_context_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn context_around_label(
+fn normalize_context_with_indices(raw: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::new();
+    let mut source_index_by_byte = Vec::new();
+    let mut pending_space = None;
+
+    for (char_idx, ch) in raw.chars().enumerate() {
+        if ch.is_whitespace() {
+            if !normalized.is_empty() {
+                pending_space.get_or_insert(char_idx);
+            }
+            continue;
+        }
+        if let Some(space_idx) = pending_space.take() {
+            normalized.push(' ');
+            source_index_by_byte.push(space_idx);
+        }
+        normalized.push(ch);
+        source_index_by_byte.resize(normalized.len(), char_idx);
+    }
+
+    (normalized, source_index_by_byte)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn context_around_link(
     text: &str,
+    source_index_by_byte: &[usize],
+    char_rects: &[Option<ModelRect>],
+    link_rect: &PageLinkRect,
+    width: u32,
+    height: u32,
+    scale: f64,
     label: &str,
-    occurrence: usize,
+    fallback_occurrence: usize,
+    used_byte_starts: &mut std::collections::HashSet<usize>,
     before_chars: usize,
     after_chars: usize,
 ) -> Option<String> {
@@ -2069,7 +2218,52 @@ fn context_around_label(
     if label.is_empty() {
         return None;
     }
-    let (start, matched) = text.match_indices(&label).nth(occurrence)?;
+    let candidates: Vec<(usize, &str)> = text.match_indices(&label).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let matched_span = candidates
+        .iter()
+        .copied()
+        .find(|&(start, matched)| {
+            if used_byte_starts.contains(&start) {
+                return false;
+            }
+            let Some(&first_char) = source_index_by_byte.get(start) else {
+                return false;
+            };
+            let Some(&last_char) = source_index_by_byte.get(start + matched.len().saturating_sub(1))
+            else {
+                return false;
+            };
+            let mut union: Option<ModelRect> = None;
+            for idx in first_char..=last_char {
+                if let Some(Some(r)) = char_rects.get(idx)
+                    && r.width() > 0.0
+                    && r.height() > 0.0
+                {
+                    union = Some(match union {
+                        Some(prev) => prev.union(*r),
+                        None => *r,
+                    });
+                }
+            }
+            let Some(bbox) = union else {
+                return false;
+            };
+            let Some(candidate_rect) = bbox_to_page_link_rect(bbox, width, height, scale) else {
+                return false;
+            };
+            candidate_rect.left < link_rect.right
+                && candidate_rect.right > link_rect.left
+                && candidate_rect.top < link_rect.bottom
+                && candidate_rect.bottom > link_rect.top
+        })
+        .or_else(|| candidates.get(fallback_occurrence).copied())?;
+
+    let (start, matched) = matched_span;
+    used_byte_starts.insert(start);
     let end = start + matched.len();
     let prefix_bytes: usize = text[..start]
         .chars()
@@ -2320,6 +2514,140 @@ mod tests {
             .collect();
         assert_eq!(gen2_pages, vec![(0, 110, 2), (1, 110, 2)]);
         assert!(pending.prefetch.is_empty());
+    }
+
+    #[test]
+    fn pending_commands_coalesce_searches_and_link_indices_per_document() {
+        let mut pending = PendingCommands::new();
+        pending.ingest(WorkerCommand::Search {
+            document_id: 1,
+            request_id: 10,
+            query: "first".into(),
+        });
+        pending.ingest(WorkerCommand::Search {
+            document_id: 2,
+            request_id: 20,
+            query: "other".into(),
+        });
+        pending.ingest(WorkerCommand::Search {
+            document_id: 1,
+            request_id: 11,
+            query: "updated".into(),
+        });
+        assert_eq!(
+            pending.searches.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                (2, 20, "other".to_string()),
+                (1, 11, "updated".to_string()),
+            ]
+        );
+
+        pending.ingest(WorkerCommand::IndexLinks {
+            document_id: 1,
+            request_id: 100,
+        });
+        pending.ingest(WorkerCommand::IndexLinks {
+            document_id: 2,
+            request_id: 200,
+        });
+        assert_eq!(
+            pending.link_indices.iter().cloned().collect::<Vec<_>>(),
+            vec![(1, 100), (2, 200)]
+        );
+
+        // Closing document 1 removes its pending search and link-index without dropping document 2.
+        pending.ingest(WorkerCommand::Close { document_id: 1 });
+        assert_eq!(
+            pending.searches.iter().cloned().collect::<Vec<_>>(),
+            vec![(2, 20, "other".to_string())]
+        );
+        assert_eq!(
+            pending.link_indices.iter().cloned().collect::<Vec<_>>(),
+            vec![(2, 200)]
+        );
+    }
+
+    #[test]
+    fn open_presentation_rejects_unsupported_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"not an office file").unwrap();
+        let err = match open_presentation(&path) {
+            Ok(_) => panic!("expected unsupported format error"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unsupported document format"), "got: {err}");
+    }
+
+    #[test]
+    fn link_indexing_matches_context_around_the_linked_occurrence_by_bbox() {
+        let mut pres = Presentation::default();
+        pres.slides.clear();
+        let mut slide = Slide {
+            id: SlideId(1),
+            show_master_shapes: false,
+            ..Default::default()
+        };
+        // First shape contains unlinked "here" in an intro sentence.
+        slide.shapes.push(Shape {
+            id: ShapeId(2),
+            xfrm: Some(Xfrm::new(40.0, 40.0, 600.0, 50.0)),
+            kind: ShapeKind::Shape,
+            text_box: true,
+            text: Some(TextBody {
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("Unlinked intro text appears here in the header.")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Second shape further down has a linked run with label "here".
+        let mut linked_run = Run::new("here");
+        linked_run.props.link = Some(Hyperlink {
+            action: Action::Url {
+                url: "https://example.com/target".into(),
+            },
+            tooltip: String::new(),
+            highlight_click: false,
+            sound: None,
+            stop_sound: false,
+            zoom_return: None,
+        });
+        slide.shapes.push(Shape {
+            id: ShapeId(3),
+            xfrm: Some(Xfrm::new(40.0, 300.0, 600.0, 50.0)),
+            kind: ShapeKind::Shape,
+            text_box: true,
+            text: Some(TextBody {
+                paragraphs: vec![Paragraph {
+                    runs: vec![
+                        Run::new("Follow the actual portal link "),
+                        linked_run,
+                        Run::new(" for details."),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        pres.slides.push(slide.into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.pptx");
+        std::fs::write(&path, deckcraft_pptx::export(&pres).unwrap()).unwrap();
+
+        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+        let indexed = index_slide_links(&mut doc, 0);
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].label, "here");
+        let ctx = indexed[0].source_context.as_deref().unwrap_or_default();
+        assert!(
+            ctx.contains("Follow the actual portal link here for details."),
+            "unexpected link context: {ctx}"
+        );
     }
 
     #[test]

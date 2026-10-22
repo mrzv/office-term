@@ -294,18 +294,30 @@ impl WordDocument {
 }
 
 fn install_embedded_fonts(doc: &Document) {
+    static INSTALLED_FONTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, u64, usize)>>,
+    > = std::sync::OnceLock::new();
+
     let embedded = wordcraft_docx::embedded_fonts(doc);
     if embedded.is_empty() {
         return;
     }
+    let installed =
+        INSTALLED_FONTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = installed.lock().unwrap_or_else(|e| e.into_inner());
     let files: Vec<(Vec<u8>, String)> = embedded
         .into_iter()
         .filter_map(|f| {
-            wordcraft_fonts::decode_font_file(&f.data)
-                .ok()
-                .map(|bytes| (bytes, f.name))
+            let bytes = wordcraft_fonts::decode_font_file(&f.data).ok()?;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&bytes, &mut hasher);
+            let hash = std::hash::Hasher::finish(&hasher);
+            guard
+                .insert((f.name.clone(), hash, bytes.len()))
+                .then_some((bytes, f.name))
         })
         .collect();
+    drop(guard);
     if !files.is_empty() {
         wordcraft_fonts::FontDb::global().add_document_fonts(files);
     }

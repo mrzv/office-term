@@ -144,7 +144,7 @@ pub fn run(path: Option<PathBuf>, start_page: u32, config: &Config) -> Result<()
     let mut app = App::new(
         worker,
         page_count,
-        start_page.min(page_count - 1),
+        start_page.min(page_count.saturating_sub(1)),
         path,
         watcher,
         (outline, revision),
@@ -861,7 +861,7 @@ impl App {
             self.forward_waiting()
         })?;
         if let Some(page) = selection {
-            let page = page.min(self.tab().page_count - 1);
+            let page = page.min(self.tab().page_count.saturating_sub(1));
             self.tab_mut().page = page;
             self.tab_mut().scroll_x = 0;
             self.tab_mut().scroll_y = 0;
@@ -939,7 +939,7 @@ impl App {
                     .parse::<u32>()
                     .ok()
                     .filter(|number| *number >= 1)
-                    .map(|number| (number - 1).min(self.tab().page_count - 1));
+                    .map(|number| (number - 1).min(self.tab().page_count.saturating_sub(1)));
                 match target {
                     Some(page) if page != self.tab().page => self.set_page(page, output)?,
                     _ => self.redraw_current(output)?,
@@ -1610,7 +1610,7 @@ impl App {
                     scroll_y: self.tab().scroll_y,
                     center_content: self.tab().center_content,
                 };
-                let page = page.min(self.tab().page_count - 1);
+                let page = page.min(self.tab().page_count.saturating_sub(1));
                 let tab = self.tab_mut();
                 if tab.link_history.len() == 100 {
                     tab.link_history.remove(0);
@@ -1646,7 +1646,7 @@ impl App {
             return Ok(());
         };
         let tab = self.tab_mut();
-        tab.page = previous.page.min(tab.page_count - 1);
+        tab.page = previous.page.min(tab.page_count.saturating_sub(1));
         tab.scroll_x = previous.scroll_x;
         tab.scroll_y = previous.scroll_y;
         tab.center_content = previous.center_content;
@@ -1788,7 +1788,7 @@ impl App {
         };
         if let Some(origin) = state.preview_origin {
             let tab = self.tab_mut();
-            tab.page = origin.page.min(tab.page_count - 1);
+            tab.page = origin.page.min(tab.page_count.saturating_sub(1));
             tab.scroll_x = origin.scroll_x;
             tab.scroll_y = origin.scroll_y;
             tab.center_content = origin.center_content;
@@ -1864,7 +1864,7 @@ impl App {
         };
         if let Some(origin) = state.preview_origin {
             let tab = self.tab_mut();
-            tab.page = origin.page.min(tab.page_count - 1);
+            tab.page = origin.page.min(tab.page_count.saturating_sub(1));
             tab.scroll_x = origin.scroll_x;
             tab.scroll_y = origin.scroll_y;
             tab.center_content = origin.center_content;
@@ -2180,7 +2180,7 @@ impl App {
             KeyCode::Left => self.move_view(Axis::Horizontal, false, false, true, output)?,
             KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page_vertically(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count.saturating_sub(1), output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('i') => self.toggle_invert(output)?,
@@ -2252,7 +2252,7 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.set_page_vertically(0, output)?,
             KeyCode::Char('G') | KeyCode::End => {
-                self.set_page_vertically(self.tab().page_count - 1, output)?
+                self.set_page_vertically(self.tab().page_count.saturating_sub(1), output)?
             }
             KeyCode::Char('m') => self.cycle_fit(output)?,
             KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(output)?,
@@ -2282,7 +2282,7 @@ impl App {
     }
 
     fn set_page_vertically(&mut self, page: u32, output: &mut impl Write) -> Result<(), AppError> {
-        let page = page.min(self.tab().page_count - 1);
+        let page = page.min(self.tab().page_count.saturating_sub(1));
         let tab = self.tab_mut();
         tab.page = page;
         tab.scroll_y = 0;
@@ -2483,7 +2483,7 @@ impl App {
             let offset = i64::from(self.tab().scroll_y);
             let delta = self.pending_vertical_scroll;
             if delta > 0 {
-                if page + 1 == self.tab().page_count {
+                if page + 1 >= self.tab().page_count {
                     self.tab_mut().scroll_y = (offset + delta).min(i64::from(
                         frame
                             .height
