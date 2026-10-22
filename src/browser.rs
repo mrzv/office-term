@@ -2,11 +2,19 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+use crate::process::Operation;
+
+const MAX_RECURSIVE_DEPTH: usize = 16;
+const MAX_RECURSIVE_FILES: usize = 10_000;
+const GIT_ROOT_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_LS_FILES_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct BrowserEntry {
@@ -45,6 +53,15 @@ pub struct BrowserState {
     recursive_entries: Vec<BrowserEntry>,
     recursive_loaded: bool,
     recursive_rx: Option<Receiver<Vec<BrowserEntry>>>,
+    recursive_op: Option<Operation>,
+}
+
+impl Drop for BrowserState {
+    fn drop(&mut self) {
+        if let Some(op) = self.recursive_op.take() {
+            op.cancel();
+        }
+    }
 }
 
 impl BrowserState {
@@ -61,6 +78,7 @@ impl BrowserState {
             recursive_entries: Vec::new(),
             recursive_loaded: false,
             recursive_rx: None,
+            recursive_op: None,
         };
         state.load_dir();
         state
@@ -74,6 +92,9 @@ impl BrowserState {
     }
 
     pub fn load_dir(&mut self) {
+        if let Some(op) = self.recursive_op.take() {
+            op.cancel();
+        }
         self.entries.clear();
         self.filter.clear();
         self.recursive_loaded = false;
@@ -173,11 +194,19 @@ impl BrowserState {
         }
         let directory = self.current_dir.clone();
         let recents = self.recents.clone();
+        let op = Operation::default();
         let (sender, receiver) = mpsc::channel();
         self.recursive_rx = Some(receiver);
+        self.recursive_op = Some(op.clone());
         thread::spawn(move || {
-            let root = find_git_root(&directory).unwrap_or_else(|| directory.clone());
-            let mut entries: Vec<_> = collect_presentation_files(&root)
+            if op.check().is_err() {
+                return;
+            }
+            let root = find_git_root(&directory, &op).unwrap_or_else(|| directory.clone());
+            if op.check().is_err() {
+                return;
+            }
+            let mut entries: Vec<_> = collect_presentation_files(&root, &op)
                 .into_iter()
                 .map(|(name, path)| BrowserEntry {
                     name,
@@ -186,11 +215,17 @@ impl BrowserState {
                     is_dir: false,
                 })
                 .collect();
+            if op.check().is_err() {
+                return;
+            }
             if let Ok(read_dir) = std::fs::read_dir(&directory) {
                 for entry in read_dir
                     .flatten()
                     .filter(|entry| is_presentation(&entry.path()))
                 {
+                    if op.check().is_err() {
+                        return;
+                    }
                     if !entries.iter().any(|existing| existing.path == entry.path()) {
                         entries.push(BrowserEntry {
                             name: entry.file_name().to_string_lossy().into_owned(),
@@ -202,6 +237,9 @@ impl BrowserState {
                 }
             }
             for path in recents {
+                if op.check().is_err() {
+                    return;
+                }
                 if !path.is_file() || !is_presentation(&path) {
                     continue;
                 }
@@ -229,18 +267,26 @@ impl BrowserState {
         let Some(receiver) = self.recursive_rx.as_ref() else {
             return false;
         };
-        let Ok(entries) = receiver.try_recv() else {
-            return false;
-        };
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
-        self.recursive_entries = entries;
-        self.recursive_loaded = true;
-        self.recursive_rx = None;
-        if !self.filter.is_empty() {
-            self.rebuild_filter();
-            self.restore_selection(selected_path.as_deref());
+        match receiver.try_recv() {
+            Ok(entries) => {
+                let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+                self.recursive_entries = entries;
+                self.recursive_loaded = true;
+                self.recursive_rx = None;
+                self.recursive_op = None;
+                if !self.filter.is_empty() {
+                    self.rebuild_filter();
+                    self.restore_selection(selected_path.as_deref());
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.recursive_rx = None;
+                self.recursive_op = None;
+                false
+            }
         }
-        true
     }
 
     pub fn recursive_loading(&self) -> bool {
@@ -438,29 +484,31 @@ impl BrowserState {
     }
 }
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(start)
-        .output()
-        .ok()?;
+fn find_git_root(start: &Path, op: &Operation) -> Option<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--show-toplevel"])
+        .current_dir(start);
+    let output = crate::process::output(&mut cmd, &op.limited(GIT_ROOT_TIMEOUT)).ok()?;
     output
         .status
         .success()
         .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string()))
 }
 
-fn collect_presentation_files(root: &Path) -> Vec<(String, PathBuf)> {
-    let git_files = Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .current_dir(root)
-        .output();
+fn collect_presentation_files(root: &Path, op: &Operation) -> Vec<(String, PathBuf)> {
+    if op.check().is_err() {
+        return Vec::new();
+    }
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ])
+    .current_dir(root);
+    let git_files = crate::process::output(&mut cmd, &op.limited(GIT_LS_FILES_TIMEOUT));
     match git_files {
         Ok(output) if output.status.success() => {
             let mut files: Vec<_> = output
@@ -469,6 +517,7 @@ fn collect_presentation_files(root: &Path) -> Vec<(String, PathBuf)> {
                 .filter(|relative| !relative.is_empty())
                 .map(|relative| Path::new(OsStr::from_bytes(relative)))
                 .filter(|relative| is_presentation(relative))
+                .take(MAX_RECURSIVE_FILES)
                 .map(|relative| (relative.to_string_lossy().into_owned(), root.join(relative)))
                 .collect();
             files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -478,21 +527,29 @@ fn collect_presentation_files(root: &Path) -> Vec<(String, PathBuf)> {
     }
 
     let mut files = Vec::new();
-    collect_presentation_files_recursive(root, root, &mut files);
+    collect_presentation_files_recursive(root, root, 0, op, &mut files);
     files
 }
 
 fn collect_presentation_files_recursive(
     directory: &Path,
     root: &Path,
+    depth: usize,
+    op: &Operation,
     files: &mut Vec<(String, PathBuf)>,
 ) {
+    if depth > MAX_RECURSIVE_DEPTH || files.len() >= MAX_RECURSIVE_FILES || op.check().is_err() {
+        return;
+    }
     let Ok(read_dir) = std::fs::read_dir(directory) else {
         return;
     };
     let mut entries: Vec<_> = read_dir.flatten().collect();
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
+        if files.len() >= MAX_RECURSIVE_FILES || op.check().is_err() {
+            return;
+        }
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
             continue;
@@ -501,7 +558,7 @@ fn collect_presentation_files_recursive(
             continue;
         };
         if file_type.is_dir() {
-            collect_presentation_files_recursive(&entry.path(), root, files);
+            collect_presentation_files_recursive(&entry.path(), root, depth + 1, op, files);
         } else if is_presentation(&entry.path()) {
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap_or(&path);
@@ -655,5 +712,68 @@ mod tests {
         browser.filter = "gss".to_string();
 
         assert_eq!(browser.match_indices("genesis.pptx"), vec![0, 4, 6]);
+    }
+
+    #[test]
+    fn recursive_collection_honors_depth_limit_and_cancellation() {
+        use super::{MAX_RECURSIVE_DEPTH, Operation, collect_presentation_files_recursive};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut current = directory.path().to_path_buf();
+        for depth in 0..=(MAX_RECURSIVE_DEPTH + 3) {
+            fs::write(current.join(format!("deck-{depth}.pptx")), b"synthetic")
+                .expect("write pptx");
+            current = current.join(format!("sub-{depth}"));
+            fs::create_dir(&current).expect("create subdir");
+        }
+
+        let op = Operation::default();
+        let mut files = Vec::new();
+        collect_presentation_files_recursive(
+            directory.path(),
+            directory.path(),
+            0,
+            &op,
+            &mut files,
+        );
+        assert_eq!(files.len(), MAX_RECURSIVE_DEPTH + 1);
+        assert!(files.iter().any(|(name, _)| name.ends_with(&format!("deck-{MAX_RECURSIVE_DEPTH}.pptx"))));
+        assert!(!files.iter().any(|(name, _)| name.ends_with(&format!("deck-{}.pptx", MAX_RECURSIVE_DEPTH + 1))));
+
+        // Pre-cancelled operation collects nothing.
+        let cancelled_op = Operation::default();
+        cancelled_op.cancel();
+        let mut cancelled_files = Vec::new();
+        collect_presentation_files_recursive(
+            directory.path(),
+            directory.path(),
+            0,
+            &cancelled_op,
+            &mut cancelled_files,
+        );
+        assert!(cancelled_files.is_empty());
+    }
+
+    #[test]
+    fn load_dir_and_drop_cancel_inflight_recursive_operation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut browser = BrowserState::new(directory.path().to_path_buf());
+        browser.preload_recursive();
+        let op_on_reload = browser
+            .recursive_op
+            .as_ref()
+            .expect("recursive_op should be set")
+            .clone();
+        browser.load_dir();
+        assert!(op_on_reload.is_cancelled());
+
+        browser.preload_recursive();
+        let op_on_drop = browser
+            .recursive_op
+            .as_ref()
+            .expect("recursive_op should be set")
+            .clone();
+        drop(browser);
+        assert!(op_on_drop.is_cancelled());
     }
 }
