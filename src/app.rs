@@ -1,7 +1,6 @@
 use crate::screenshot::Page as ScreenshotPage;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,24 +30,35 @@ use crate::config::{Config, LinkPickerLayout, ViewerSettings};
 use crate::kitty::{self, Placement};
 use crate::pptx::{
     DarkModeStyle, DocumentId, DocumentLink, DocumentRevision, FitMode, Frame, LinkTarget,
-    OutlineItem, PageLink, PptxWorker, RenderKey, RenderRequest, SearchPageMatch, WorkerMessage,
+    OutlineItem, PptxWorker, RenderKey, RenderRequest, SearchPageMatch, WorkerMessage,
 };
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
+mod scale;
 mod session;
+mod status;
+#[cfg(test)]
+use scale::ZOOM_STEP;
+use scale::{
+    ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, centered_scaled_view, content_axis_scroll,
+    content_horizontal_scroll, content_scroll, fitted_page_size, horizontal_scroll_to_reveal,
+    link_at_cell, scale_zoom, stepped_zoom,
+};
 #[cfg(test)]
 use session::FileFingerprint;
 use session::{FileWatcher, Session, Tab};
+#[cfg(test)]
+use status::render_timing_status;
+use status::{
+    PerformanceSnapshot, StatusText, cycled_tab_index, numbered_tab_index, stale_status_row,
+    write_clipboard_osc52,
+};
 
 const FILE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_STABLE_FOR: Duration = Duration::from_millis(150);
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LINK_PREVIEW_DELAY: Duration = Duration::from_millis(120);
 const INITIAL_DOCUMENT_ID: DocumentId = 1;
-const ZOOM_DEFAULT: u16 = 100;
-const ZOOM_MIN: u16 = 100;
-const ZOOM_MAX: u16 = 400;
-const ZOOM_STEP: u16 = 25;
 const PAGE_IMAGE_Z_INDEX: i32 = i32::MIN / 2 - 2;
 const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
@@ -132,7 +142,7 @@ pub fn run(path: Option<PathBuf>, start_page: u32, config: &Config) -> Result<()
     let _terminal = TerminalGuard::enter(&mut output, theme)?;
     let path = match path {
         Some(path) => path.canonicalize()?,
-        None => match pick_pdf(std::env::current_dir()?, &mut output, theme, || Ok(false))? {
+        None => match pick_document(std::env::current_dir()?, &mut output, theme, || Ok(false))? {
             Some(path) => path,
             None => return Ok(()),
         },
@@ -304,6 +314,7 @@ struct App {
     persistent_link_picker: bool,
     link_picker_geometry: LinkPickerGeometry,
     show_performance: bool,
+    pending_clipboard: Option<String>,
     theme: Palette,
     themes: Vec<(String, Palette)>,
     theme_index: usize,
@@ -534,33 +545,6 @@ fn link_key(link: &DocumentLink) -> (u32, u32) {
     (link.source_page, link.ordinal)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PerformanceSnapshot {
-    render_ms: u128,
-    dark_mode_ms: Option<u128>,
-    highlight_ms: Option<u128>,
-    compression_ms: u128,
-    transfer_ms: u128,
-    link_count: usize,
-}
-
-impl PerformanceSnapshot {
-    fn status(self, detailed: bool, link_mode: bool) -> String {
-        let mut status = render_timing_status(
-            self.render_ms,
-            self.dark_mode_ms,
-            self.highlight_ms,
-            self.compression_ms,
-            self.transfer_ms,
-            detailed,
-        );
-        if link_mode {
-            status.push_str(&format!("  {} page links", self.link_count));
-        }
-        status
-    }
-}
-
 #[derive(Clone, Default)]
 struct SearchState {
     query: String,
@@ -708,34 +692,6 @@ fn terminal_color_rgb(color: crossterm::style::Color) -> [u8; 3] {
     }
 }
 
-fn render_timing_status(
-    render_ms: u128,
-    dark_mode_ms: Option<u128>,
-    highlight_ms: Option<u128>,
-    compression_ms: u128,
-    transfer_ms: u128,
-    detailed: bool,
-) -> String {
-    if detailed {
-        let dark_mode = dark_mode_ms
-            .map(|elapsed| format!("  dark {elapsed}ms"))
-            .unwrap_or_default();
-        let highlight = highlight_ms
-            .map(|elapsed| format!("  highlight {elapsed}ms"))
-            .unwrap_or_default();
-        return format!(
-            "render {render_ms}ms{dark_mode}{highlight}  compress {compression_ms}ms  transfer {transfer_ms}ms"
-        );
-    }
-
-    let total_ms = render_ms
-        + dark_mode_ms.unwrap_or_default()
-        + highlight_ms.unwrap_or_default()
-        + compression_ms
-        + transfer_ms;
-    format!("render {total_ms}ms")
-}
-
 impl App {
     fn new(
         worker: PptxWorker,
@@ -812,6 +768,7 @@ impl App {
             persistent_link_picker: defaults.persistent_link_picker,
             link_picker_geometry: defaults.link_picker_geometry,
             show_performance: false,
+            pending_clipboard: None,
             theme: defaults.theme,
             themes: defaults.themes,
             theme_index: defaults.theme_index,
@@ -830,7 +787,8 @@ impl App {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        match pick_pdf(directory, output, self.theme, || self.forward_waiting())? {
+        let theme = self.theme;
+        match pick_document(directory, output, theme, || self.poll_modal_background())? {
             Some(path) => {
                 let path = path.canonicalize()?;
                 if let Some(index) = self.tab_index_for_path(&path) {
@@ -843,7 +801,7 @@ impl App {
             }
             None => self.request_current(output)?,
         }
-        Ok(())
+        self.flush_pending_clipboard(output)
     }
 
     fn open_outline(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -857,8 +815,10 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        let selection = pick_outline(&outline, self.tab().page, output, self.theme, || {
-            self.forward_waiting()
+        let current_page = self.tab().page;
+        let theme = self.theme;
+        let selection = pick_outline(&outline, current_page, output, theme, || {
+            self.poll_modal_background()
         })?;
         if let Some(page) = selection {
             let page = page.min(self.tab().page_count.saturating_sub(1));
@@ -868,7 +828,8 @@ impl App {
             self.tab_mut().center_content = true;
         }
         self.reset_render_state();
-        self.request_current(output)
+        self.request_current(output)?;
+        self.flush_pending_clipboard(output)
     }
 
     fn open_theme_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -876,15 +837,18 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        let selection = pick_theme(&self.themes, self.theme_index, output, || {
-            self.forward_waiting()
+        let themes = self.themes.clone();
+        let theme_index = self.theme_index;
+        let selection = pick_theme(&themes, theme_index, output, || {
+            self.poll_modal_background()
         })?;
         if let Some(index) = selection {
             self.apply_theme(index);
         }
         self.clear_viewer(output)?;
         self.reset_render_state();
-        self.request_current(output)
+        self.request_current(output)?;
+        self.flush_pending_clipboard(output)
     }
 
     fn open_help(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -892,10 +856,88 @@ impl App {
             return Ok(());
         }
         self.clear_viewer(output)?;
-        show_help(output, self.theme, || self.forward_waiting())?;
+        let theme = self.theme;
+        show_help(output, theme, || self.poll_modal_background())?;
         self.clear_viewer(output)?;
         self.reset_render_state();
-        self.request_current(output)
+        self.request_current(output)?;
+        self.flush_pending_clipboard(output)
+    }
+
+    fn poll_modal_background(&mut self) -> Result<bool, AppError> {
+        while let Some(message) = self.worker.try_recv() {
+            self.handle_modal_worker_message(message)?;
+        }
+        self.forward_waiting().map_err(AppError::Io)
+    }
+
+    fn handle_modal_worker_message(&mut self, message: WorkerMessage) -> Result<(), AppError> {
+        match message {
+            WorkerMessage::Frame(frame) => {
+                self.store_frame(frame);
+            }
+            WorkerMessage::Error(error) => return Err(AppError::Renderer(error)),
+            WorkerMessage::Ready { .. }
+            | WorkerMessage::Opened { .. }
+            | WorkerMessage::OpenError { .. } => {}
+            WorkerMessage::Text { content, .. } => {
+                self.pending_clipboard = Some(content);
+            }
+            WorkerMessage::SearchProgress {
+                document_id,
+                request_id,
+                scanned,
+                total,
+                matches,
+                total_occurrences,
+            } => {
+                self.apply_search_progress(
+                    document_id,
+                    SearchProgressUpdate {
+                        request_id,
+                        scanned,
+                        total,
+                        matches,
+                        total_occurrences,
+                    },
+                );
+            }
+            WorkerMessage::SearchResults {
+                document_id,
+                request_id,
+                matches,
+                total_occurrences,
+            } => {
+                self.apply_search_results(document_id, request_id, matches, total_occurrences);
+            }
+            WorkerMessage::LinkIndexProgress {
+                document_id,
+                request_id,
+                links,
+                scanned,
+                total,
+                complete,
+            } => {
+                self.apply_link_index_progress(
+                    document_id,
+                    LinkIndexUpdate {
+                        request_id,
+                        links,
+                        scanned,
+                        total,
+                        complete,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_clipboard(&mut self, output: &mut impl Write) -> Result<(), AppError> {
+        if let Some(content) = self.pending_clipboard.take() {
+            self.copy_text(&content, output)?;
+        }
+        Ok(())
     }
 
     fn apply_theme(&mut self, index: usize) {
@@ -1089,23 +1131,32 @@ impl App {
         self.open_search_picker(output)
     }
 
-    fn receive_search_progress(
+    fn apply_search_progress(
         &mut self,
         document_id: DocumentId,
         update: SearchProgressUpdate,
-        output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        let Some(index) = self.tab_index(document_id) else {
-            return Ok(());
-        };
+    ) -> Option<usize> {
+        let index = self.tab_index(document_id)?;
         if self.session.tabs[index].search.request_id != update.request_id {
-            return Ok(());
+            return None;
         }
         let search = &mut self.session.tabs[index].search;
         search.scanned = update.scanned;
         search.total_pages = update.total;
         search.matches = update.matches;
         search.total_occurrences = update.total_occurrences;
+        Some(index)
+    }
+
+    fn receive_search_progress(
+        &mut self,
+        document_id: DocumentId,
+        update: SearchProgressUpdate,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some(index) = self.apply_search_progress(document_id, update) else {
+            return Ok(());
+        };
         if index == self.session.active_tab {
             if self.search_picker.is_some() {
                 self.redraw_search_picker(output)?;
@@ -1115,19 +1166,16 @@ impl App {
         Ok(())
     }
 
-    fn receive_search_results(
+    fn apply_search_results(
         &mut self,
         document_id: DocumentId,
         request_id: u64,
         matches: Vec<SearchPageMatch>,
         total_occurrences: u32,
-        output: &mut impl Write,
-    ) -> Result<(), AppError> {
-        let Some(index) = self.tab_index(document_id) else {
-            return Ok(());
-        };
+    ) -> Option<(usize, Option<u32>)> {
+        let index = self.tab_index(document_id)?;
         if self.session.tabs[index].search.request_id != request_id {
-            return Ok(());
+            return None;
         }
         let current_page = self.session.tabs[index].page;
         let target_page = matches
@@ -1141,22 +1189,60 @@ impl App {
         search.scanned = search.total_pages;
         search.searching = false;
 
+        if index == self.session.active_tab {
+            if let Some(state) = &mut self.search_picker {
+                state.sync(current_page, &self.session.tabs[index].search.matches);
+            }
+            if let Some(page) = target_page {
+                let tab = &mut self.session.tabs[index];
+                tab.page = page;
+                tab.scroll_x = 0;
+                tab.scroll_y = 0;
+                tab.center_content = true;
+            }
+        }
+        Some((index, target_page))
+    }
+
+    fn receive_search_results(
+        &mut self,
+        document_id: DocumentId,
+        request_id: u64,
+        matches: Vec<SearchPageMatch>,
+        total_occurrences: u32,
+        output: &mut impl Write,
+    ) -> Result<(), AppError> {
+        let Some((index, target_page)) =
+            self.apply_search_results(document_id, request_id, matches, total_occurrences)
+        else {
+            return Ok(());
+        };
         if index != self.session.active_tab {
             return Ok(());
         }
-        if let Some(state) = &mut self.search_picker {
-            state.sync(current_page, &self.session.tabs[index].search.matches);
-        }
-        if let Some(page) = target_page {
-            self.session.tabs[index].page = page;
-            self.session.tabs[index].scroll_x = 0;
-            self.session.tabs[index].scroll_y = 0;
-            self.session.tabs[index].center_content = true;
+        if target_page.is_some() {
             self.request_current(output)?;
         } else {
             self.draw_status(output, self.viewport()?, "")?;
         }
         Ok(())
+    }
+
+    fn apply_link_index_progress(
+        &mut self,
+        document_id: DocumentId,
+        update: LinkIndexUpdate,
+    ) -> Option<usize> {
+        let index = self.tab_index(document_id)?;
+        let link_index = &mut self.session.tabs[index].link_index;
+        if link_index.request_id != update.request_id {
+            return None;
+        }
+        link_index.links.extend(update.links);
+        link_index.scanned = update.scanned;
+        link_index.total_pages = update.total;
+        link_index.indexing = !update.complete;
+        Some(index)
     }
 
     fn receive_link_index_progress(
@@ -1165,18 +1251,9 @@ impl App {
         update: LinkIndexUpdate,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let Some(index) = self.tab_index(document_id) else {
+        let Some(index) = self.apply_link_index_progress(document_id, update) else {
             return Ok(());
         };
-        let link_index = &mut self.session.tabs[index].link_index;
-        if link_index.request_id != update.request_id {
-            return Ok(());
-        }
-        link_index.links.extend(update.links);
-        link_index.scanned = update.scanned;
-        link_index.total_pages = update.total;
-        link_index.indexing = !update.complete;
-
         if index == self.session.active_tab && self.link_picker.is_some() {
             self.redraw_link_picker(output)?;
         }
@@ -2838,16 +2915,14 @@ impl App {
         Ok(())
     }
 
-    fn receive_frame(&mut self, frame: Frame, output: &mut impl Write) -> Result<(), AppError> {
+    fn store_frame(&mut self, frame: Frame) -> Option<(usize, Arc<Frame>)> {
         if frame.generation != self.generation {
-            return Ok(());
+            return None;
         }
-        let Some(index) = self.tab_index(frame.key.document_id) else {
-            return Ok(());
-        };
+        let index = self.tab_index(frame.key.document_id)?;
         let tab = &self.session.tabs[index];
         if frame.key.page >= tab.page_count || frame.revision != tab.revision {
-            return Ok(());
+            return None;
         }
         let key = frame.key;
         self.pending.remove(&key);
@@ -2886,6 +2961,14 @@ impl App {
                 && (cached.selected_link_ordinal.is_none()
                     || cached.selected_link_ordinal == key.selected_link_ordinal)
         });
+        Some((index, frame))
+    }
+
+    fn receive_frame(&mut self, frame: Frame, output: &mut impl Write) -> Result<(), AppError> {
+        let Some((_index, frame)) = self.store_frame(frame) else {
+            return Ok(());
+        };
+        let key = frame.key;
         if let Some((waiting, fit, zoom)) = self.pending_scale
             && waiting == key
         {
@@ -3516,78 +3599,6 @@ impl App {
     }
 }
 
-/// Writes text to the system clipboard using the OSC 52 escape sequence, which
-/// works over SSH because the terminal emulator performs the copy locally.
-fn write_clipboard_osc52(output: &mut impl Write, text: &str) -> io::Result<()> {
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    write!(output, "\x1b]52;c;{encoded}\x07")?;
-    output.flush()
-}
-
-fn link_at_cell(
-    links: &[PageLink],
-    placement: ImagePlacement,
-    image_width: u32,
-    image_height: u32,
-    viewport_top: u16,
-    column: u16,
-    row: u16,
-) -> Option<LinkTarget> {
-    let cell = placement.source_cell(
-        column,
-        row.checked_sub(viewport_top)?,
-        image_width,
-        image_height,
-    )?;
-    let (x0, x1, y0, y1) = (cell.x, cell.x + cell.width, cell.y, cell.y + cell.height);
-    let cell_center_x = u64::from(x0) + u64::from(x1);
-    let cell_center_y = u64::from(y0) + u64::from(y1);
-
-    links
-        .iter()
-        .filter(|link| {
-            link.rect.left < x1
-                && link.rect.right > x0
-                && link.rect.top < y1
-                && link.rect.bottom > y0
-        })
-        .min_by_key(|link| {
-            let link_center_x = u64::from(link.rect.left) + u64::from(link.rect.right);
-            let link_center_y = u64::from(link.rect.top) + u64::from(link.rect.bottom);
-            cell_center_x
-                .abs_diff(link_center_x)
-                .saturating_pow(2)
-                .saturating_add(cell_center_y.abs_diff(link_center_y).saturating_pow(2))
-        })
-        .map(|link| link.target.clone())
-}
-
-/// Keep a visible horizontal target stationary; otherwise reveal it with the least movement.
-fn horizontal_scroll_to_reveal(
-    current: u32,
-    page_width: u32,
-    viewport_width: u32,
-    target_left: f32,
-    target_right: f32,
-) -> u32 {
-    let left = (target_left.min(target_right).floor() as u32).min(page_width.saturating_sub(1));
-    let right = (target_left.max(target_right).ceil() as u32)
-        .max(left.saturating_add(1))
-        .min(page_width);
-    let right_aligned = right.saturating_sub(viewport_width);
-    let min_scroll = left.min(right_aligned);
-    let max_scroll = left.max(right_aligned);
-    let page_max = page_width.saturating_sub(viewport_width);
-    // Continuous view can share an offset larger than this page can crop.
-    // Judge visibility using this page's actual crop, without moving its wider neighbor.
-    if (min_scroll..=max_scroll).contains(&current.min(page_max)) {
-        current
-    } else {
-        current.clamp(min_scroll, max_scroll).min(page_max)
-    }
-}
-
 fn same_render_view(a: RenderKey, b: RenderKey) -> bool {
     a.document_id == b.document_id
         && a.width == b.width
@@ -3598,245 +3609,11 @@ fn same_render_view(a: RenderKey, b: RenderKey) -> bool {
         && a.dark_mode_style == b.dark_mode_style
 }
 
-/// Clip all styled status fragments to one row without emitting text controls.
-struct StatusText<'a, T>(T, &'a Cell<usize>);
-
-impl<T: fmt::Display> fmt::Display for StatusText<'_, T> {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write as _;
-        write!(
-            StatusWriter {
-                output,
-                columns: self.1
-            },
-            "{}",
-            self.0
-        )
-    }
-}
-
-struct StatusWriter<'a, 'b> {
-    output: &'a mut fmt::Formatter<'b>,
-    columns: &'a Cell<usize>,
-}
-
-impl fmt::Write for StatusWriter<'_, '_> {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        for part in value.split_inclusive(char::is_control) {
-            let span = Span::raw(part);
-            for grapheme in span.styled_graphemes(Style::default()) {
-                let width = Span::raw(grapheme.symbol).width();
-                if self.columns.get() == 0 || width > self.columns.get() {
-                    self.columns.set(0);
-                    return Ok(());
-                }
-                self.output.write_str(grapheme.symbol)?;
-                self.columns.set(self.columns.get() - width);
-            }
-            if part.ends_with(char::is_control) && self.columns.get() > 0 {
-                self.output.write_str(" ")?;
-                self.columns.set(self.columns.get() - 1);
-            }
-        }
-        Ok(())
-    }
-}
-
-fn stale_status_row(previous: Option<u16>, current: u16) -> Option<u16> {
-    previous.filter(|row| *row < current)
-}
-
-fn cycled_tab_index(active: usize, len: usize, direction: i32) -> usize {
-    if direction > 0 {
-        (active + 1) % len
-    } else if active == 0 {
-        len - 1
-    } else {
-        active - 1
-    }
-}
-
-/// Steps the zoom percentage by one increment, snapping to the `ZOOM_STEP`
-/// grid and clamping to the supported range.
-fn stepped_zoom(current: u16, zoom_in: bool) -> u16 {
-    let next = if zoom_in {
-        current.saturating_add(ZOOM_STEP)
-    } else {
-        current.saturating_sub(ZOOM_STEP)
-    };
-    next.clamp(ZOOM_MIN, ZOOM_MAX)
-}
-
-fn scale_zoom(value: u32, old_zoom: u16, new_zoom: u16) -> u32 {
-    ((u64::from(value) * u64::from(new_zoom) + u64::from(old_zoom) / 2) / u64::from(old_zoom))
-        .min(u64::from(u32::MAX)) as u32
-}
-
-fn scale_pixels(value: u32, old_size: u32, new_size: u32) -> u32 {
-    let old_size = u64::from(old_size.max(1));
-    ((u64::from(value) * u64::from(new_size) + old_size / 2) / old_size).min(u64::from(u32::MAX))
-        as u32
-}
-
-fn content_axis_scroll(start: f32, end: f32, size: u32, visible: u16) -> u32 {
-    (((start + end) * 0.5 * size as f32 - f32::from(visible) * 0.5)
-        .round()
-        .max(0.0) as u32)
-        .min(size.saturating_sub(u32::from(visible)))
-}
-
-fn content_scroll(frame: &Frame, viewport: Viewport) -> (i64, u32) {
-    let [left, top, right, bottom] = frame.content_bounds;
-    (
-        i64::from(content_axis_scroll(
-            left,
-            right,
-            frame.width,
-            viewport.pixel_width,
-        )),
-        content_axis_scroll(top, bottom, frame.height, viewport.pixel_height),
-    )
-}
-
-// Keep content-relative pan signed until placement: a narrower first visible
-// page must not clamp the horizontal anchor of a wider following page.
-fn content_horizontal_scroll(scroll_x: i64, from: &Frame, to: &Frame, viewport: Viewport) -> i64 {
-    if from.key.fit == FitMode::Content {
-        scroll_x - content_scroll(from, viewport).0 + content_scroll(to, viewport).0
-    } else {
-        scroll_x
-    }
-}
-
-fn fitted_page_size(
-    viewport: Viewport,
-    width: f32,
-    height: f32,
-    content: [f32; 4],
-    fit: FitMode,
-    zoom: u16,
-) -> (u32, u32) {
-    let target_width = (u32::from(viewport.pixel_width) * u32::from(zoom) / 100).max(1);
-    let target_height = (u32::from(viewport.pixel_height) * u32::from(zoom) / 100).max(1);
-    // Match PDFium's f32 scaling and final rounding, using the original PDF
-    // dimensions: reconstructing aspect ratio from a raster amplifies rounding.
-    fit.raster_size(width, height, content, target_width, target_height)
-}
-
-/// Keep the PDF point under the viewport center fixed, even if it belongs to
-/// the next visible page. Page gaps stay one terminal row rather than scaling.
-/// Geometry includes an optional content-centered horizontal origin. Rebase
-/// between these origins when the center page and first visible page differ.
-fn centered_scaled_view(
-    viewport: Viewport,
-    mut page: u32,
-    page_count: u32,
-    (scroll_x, scroll_y): (i64, u32),
-    scaled_size: impl Fn(u32, u32, u32) -> Option<(u32, u32, Option<u32>)>,
-    continuous: bool,
-    page_size: impl Fn(u32) -> Option<(u32, u32, Option<u32>)>,
-) -> Result<(u32, i64, u32), u32> {
-    let width = u32::from(viewport.pixel_width);
-    let height = u32::from(viewport.pixel_height);
-    let half_width = i64::from(width / 2);
-    let half_height = i64::from(height / 2);
-    let gap = (height / u32::from(viewport.rows).max(1)).max(1);
-    let mut center_y = i64::from(scroll_y) + half_height;
-    let mut geometry = page_size(page).ok_or(page)?;
-    let initial_origin = geometry.2.unwrap_or(0);
-    if continuous {
-        while page + 1 < page_count {
-            let span = i64::from(geometry.1) + i64::from(gap);
-            if center_y < span {
-                break;
-            }
-            center_y -= span;
-            page += 1;
-            geometry = page_size(page).ok_or(page)?;
-        }
-    }
-    let (page_width, page_height, origin) = geometry;
-    let scroll_x =
-        (scroll_x - i64::from(initial_origin) + i64::from(origin.unwrap_or(0))).max(0) as u32;
-    let (new_width, new_height, new_origin) =
-        scaled_size(page, page_width, page_height).ok_or(page)?;
-    let center_x = if page_width < width {
-        // Narrow images are centered by whole terminal cells; leftover pixels
-        // stay on the right, not symmetrically around the image midpoint.
-        let cell_width = (width / u32::from(viewport.columns).max(1)).max(1);
-        let left = u32::from(viewport.place(page_width, page_height, 0, 0).left) * cell_width;
-        (width / 2).saturating_sub(left).min(page_width)
-    } else {
-        scroll_x
-            .min(page_width.saturating_sub(width))
-            .saturating_add(width / 2)
-            .min(page_width)
-    };
-    let x = (i64::from(scale_pixels(center_x, page_width, new_width)) - half_width)
-        .clamp(0, i64::from(new_width.saturating_sub(width))) as u32;
-    if center_y >= i64::from(page_height) && (!continuous || page + 1 == page_count) {
-        center_y = i64::from(page_height / 2);
-    }
-    let mut y = i64::from(scale_pixels(
-        center_y.min(i64::from(page_height)) as u32,
-        page_height,
-        new_height,
-    )) - half_height;
-    if continuous {
-        while y < 0 && page > 0 {
-            page -= 1;
-            let (previous_width, previous_height, _) = page_size(page).ok_or(page)?;
-            y += i64::from(
-                scaled_size(page, previous_width, previous_height)
-                    .ok_or(page)?
-                    .1,
-            ) + i64::from(gap);
-        }
-        while page + 1 < page_count {
-            let (current_width, current_height, _) = page_size(page).ok_or(page)?;
-            let span = i64::from(
-                scaled_size(page, current_width, current_height)
-                    .ok_or(page)?
-                    .1,
-            ) + i64::from(gap);
-            if y < span {
-                break;
-            }
-            y -= span;
-            page += 1;
-        }
-    }
-    let (top_page_width, top_page_height, _) = page_size(page).ok_or(page)?;
-    let (_, scaled_height, top_origin) =
-        scaled_size(page, top_page_width, top_page_height).ok_or(page)?;
-    let x = if let (Some(new_origin), Some(top_origin)) = (new_origin, top_origin) {
-        i64::from(x) - i64::from(new_origin) + i64::from(top_origin)
-    } else {
-        i64::from(x)
-    };
-    let max_y = if continuous && page + 1 < page_count {
-        scaled_height.saturating_add(gap - 1)
-    } else {
-        scaled_height.saturating_sub(height)
-    };
-    Ok((page, x, y.clamp(0, i64::from(max_y)) as u32))
-}
-
-fn numbered_tab_index(key: KeyEvent) -> Option<usize> {
-    let digit = match key.code {
-        KeyCode::Char(digit) if ('1'..='9').contains(&digit) => digit,
-        _ => return None,
-    };
-    key.modifiers
-        .contains(KeyModifiers::ALT)
-        .then(|| usize::from(digit as u8 - b'1'))
-}
-
-fn pick_pdf(
+fn pick_document(
     directory: PathBuf,
     output: &mut impl Write,
     theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
+    mut interrupt: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<Option<PathBuf>, AppError> {
     let mut browser = BrowserState::new(directory);
     browser.set_recents(crate::recent::load());
@@ -3932,7 +3709,7 @@ fn clear_picker(output: &mut impl Write, theme: Palette) -> io::Result<()> {
 fn show_help(
     output: &mut impl Write,
     theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
+    mut interrupt: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<(), AppError> {
     let backend = CrosstermBackend::new(&mut *output);
     let mut terminal = Terminal::new(backend)?;
@@ -3972,7 +3749,7 @@ fn pick_theme(
     themes: &[(String, Palette)],
     current: usize,
     output: &mut impl Write,
-    interrupt: impl Fn() -> io::Result<bool>,
+    mut interrupt: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<Option<usize>, AppError> {
     let mut filter = String::new();
     let mut filtered = filter_theme_indices(themes, &filter);
@@ -4485,7 +4262,7 @@ fn pick_outline(
     current_page: u32,
     output: &mut impl Write,
     theme: Palette,
-    interrupt: impl Fn() -> io::Result<bool>,
+    mut interrupt: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<Option<u32>, AppError> {
     let mut filter = String::new();
     let mut filtered: Vec<usize> = (0..items.len()).collect();
@@ -8833,5 +8610,110 @@ mod tests {
         let floating_output = String::from_utf8(floating_output).expect("terminal output");
         assert!(!floating_output.contains("a=p"));
         assert!(!floating_output.contains("a=T"));
+    }
+
+    #[test]
+    fn modal_worker_messages_update_state_and_defer_clipboard_output() {
+        let (mut app, viewport, _file) = continuous_app();
+        let target_key = app.page_key(1, viewport);
+        assert!(app.pending.contains(&target_key));
+        assert!(!app.tab().cache.contains_key(&target_key));
+
+        let frame = (*continuous_frame(target_key, app.tab().revision, false)).clone();
+        app.handle_modal_worker_message(crate::pptx::WorkerMessage::Frame(frame))
+            .expect("frame message should succeed");
+        assert!(!app.pending.contains(&target_key));
+        assert!(app.tab().cache.contains_key(&target_key));
+
+        let document_id = app.tab().document_id;
+        app.tab_mut().search = SearchState {
+            query: "needle".to_string(),
+            request_id: 7,
+            matches: Vec::new(),
+            total_occurrences: 0,
+            scanned: 0,
+            total_pages: 2,
+            searching: true,
+        };
+        app.handle_modal_worker_message(crate::pptx::WorkerMessage::SearchProgress {
+            document_id,
+            request_id: 7,
+            scanned: 1,
+            total: 2,
+            matches: vec![SearchPageMatch {
+                page: 1,
+                occurrences: 2,
+                context: "needle".to_string(),
+            }],
+            total_occurrences: 2,
+        })
+        .expect("search progress should succeed");
+        assert_eq!(app.tab().search.scanned, 1);
+        assert!(app.tab().search.searching);
+
+        app.handle_modal_worker_message(crate::pptx::WorkerMessage::SearchResults {
+            document_id,
+            request_id: 7,
+            matches: vec![SearchPageMatch {
+                page: 1,
+                occurrences: 3,
+                context: "needle".to_string(),
+            }],
+            total_occurrences: 3,
+        })
+        .expect("search results should succeed");
+        assert!(!app.tab().search.searching);
+        assert_eq!(app.tab().search.total_occurrences, 3);
+        assert_eq!(app.tab().page, 1);
+
+        app.tab_mut().link_index = super::LinkIndexState {
+            request_id: 9,
+            links: Vec::new(),
+            scanned: 0,
+            total_pages: 2,
+            indexing: true,
+        };
+        app.handle_modal_worker_message(crate::pptx::WorkerMessage::LinkIndexProgress {
+            document_id,
+            request_id: 9,
+            links: vec![DocumentLink {
+                source_page: 0,
+                ordinal: 0,
+                source_top_ratio: 0.1,
+                label: "Section".to_string(),
+                source_context: None,
+                reference_context: None,
+                target: LinkTarget::Uri("https://example.com".to_string()),
+            }],
+            scanned: 2,
+            total: 2,
+            complete: true,
+        })
+        .expect("link index progress should succeed");
+        assert!(!app.tab().link_index.indexing);
+        assert_eq!(app.tab().link_index.links.len(), 1);
+
+        app.handle_modal_worker_message(crate::pptx::WorkerMessage::Text {
+            document_id,
+            page: 0,
+            content: "copied slide text".to_string(),
+        })
+        .expect("text message should succeed");
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("copied slide text")
+        );
+
+        let mut output = Vec::new();
+        app.flush_pending_clipboard(&mut output)
+            .expect("flushing pending clipboard should succeed");
+        assert!(app.pending_clipboard.is_none());
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("\x1b]52;c;"));
+
+        assert!(
+            app.handle_modal_worker_message(crate::pptx::WorkerMessage::Error("boom".to_string()))
+                .is_err()
+        );
     }
 }
