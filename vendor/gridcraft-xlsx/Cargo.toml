@@ -1,0 +1,28 @@
+[package]
+name = "gridcraft-xlsx"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "GridCraft file formats: XLSX (SpreadsheetML) and CSV import/export"
+repository = "https://github.com/storytold/gridcraft"
+
+[package.metadata.upstream]
+revision = "8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[features]
+test-support = []
+
+[dependencies]
+gridcraft-core = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-formula = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft" }
+thiserror = "2"
+quick-xml = "0.41"
+zip = { version = "3", default-features = false, features = ["deflate"] }
+aes = { version = "0.9", default-features = false }
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }

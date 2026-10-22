@@ -175,8 +175,8 @@ pub fn language(lang: Option<&str>) -> String {
     lang.and_then(|l| l.split(['-', '_']).next()).unwrap_or("").trim().to_ascii_lowercase()
 }
 
-fn tailoring(lang: Option<&str>) -> &'static [Tailor] {
-    match language(lang).as_str() {
+fn tailoring(lang: &str) -> &'static [Tailor] {
+    match lang {
         "pl" => PL,
         "cs" => CS,
         "sk" => SK,
@@ -332,9 +332,27 @@ const COMPOSE: &[(char, char, char)] = &[
 ];
 
 /// `s` lowercased, with each letter + combining mark that has a single-letter form composed.
-fn lower_composed(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.to_lowercase().chars() {
+fn lower_composed(s: &str, lang: &str) -> String {
+    let lower = if matches!(lang, "tr" | "az") && s.contains(['I', 'İ']) {
+        let mut lower = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                'I' if chars.peek() == Some(&'\u{307}') => {
+                    chars.next();
+                    lower.push('i');
+                }
+                'I' => lower.push('ı'),
+                'İ' => lower.push('i'),
+                _ => lower.push(c),
+            }
+        }
+        lower.to_lowercase()
+    } else {
+        s.to_lowercase()
+    };
+    let mut out = String::with_capacity(lower.len());
+    for c in lower.chars() {
         if let Some(prev) = out.chars().next_back()
             && let Some((_, _, composed)) = COMPOSE.iter().find(|(b, m, _)| *b == prev && *m == c)
         {
@@ -391,8 +409,9 @@ pub struct SortKey {
 /// The sort key of `s` for language `lang` (a BCP 47 tag such as `pl-PL`; `None` sorts like
 /// English).
 pub fn sort_key(s: &str, lang: Option<&str>) -> SortKey {
-    let text = lower_composed(s);
-    let rules = tailoring(lang);
+    let lang = language(lang);
+    let text = lower_composed(s, &lang);
+    let rules = tailoring(&lang);
     let mut key = SortKey::default();
     let mut i = 0;
     while let Some(rest) = text.get(i..).filter(|r| !r.is_empty()) {
@@ -421,8 +440,9 @@ pub fn collate(a: &str, b: &str, lang: Option<&str>) -> Ordering {
 /// The index heading letter `s` files under in language `lang`: `Ł` for `Łódź` in Polish, `L`
 /// in English; `Ch` for `chata` in Czech; `A` for `Äpfel` in German, `Ä` in Swedish.
 pub fn heading_letter(s: &str, lang: Option<&str>) -> Option<String> {
-    let low = lower_composed(s.trim_start());
-    let (e, _) = next_elem(&low, tailoring(lang))?;
+    let lang = language(lang);
+    let low = lower_composed(s.trim_start(), &lang);
+    let (e, _) = next_elem(&low, tailoring(&lang))?;
     let shown = if e.own || e.sec == 0 {
         e.text.to_string()
     } else {
@@ -430,12 +450,30 @@ pub fn heading_letter(s: &str, lang: Option<&str>) -> Option<String> {
     };
     let mut cs = shown.chars();
     let first = cs.next()?;
+    if first == 'i' && matches!(lang.as_str(), "tr" | "az") {
+        return Some(std::iter::once('İ').chain(cs).collect());
+    }
     Some(first.to_uppercase().chain(cs).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turkic_case_pairs_keep_dotted_and_dotless_i_distinct() {
+        for lang in ["tr", "tr-TR", "TR_tr", "az-Latn-AZ"] {
+            assert_eq!(collate("I", "ı", Some(lang)), Ordering::Equal);
+            assert_eq!(collate("İ", "i", Some(lang)), Ordering::Equal);
+            assert_eq!(collate("I\u{307}", "i", Some(lang)), Ordering::Equal);
+            assert_eq!(collate("I", "i", Some(lang)), Ordering::Less);
+            assert_eq!(sort_key("ΟΣ", Some(lang)), sort_key("ος", Some(lang)));
+            assert_eq!(sort_key("IΟΣ", Some(lang)), sort_key("ıος", Some(lang)));
+            assert_eq!(heading_letter("izmir", Some(lang)).as_deref(), Some("İ"));
+            assert_eq!(heading_letter("Isparta", Some(lang)).as_deref(), Some("I"));
+        }
+        assert_eq!(collate("I", "i", Some("en-US")), Ordering::Equal);
+    }
 
     fn sorted(words: &[&str], lang: &str) -> Vec<String> {
         let mut v: Vec<String> = words.iter().map(|w| w.to_string()).collect();

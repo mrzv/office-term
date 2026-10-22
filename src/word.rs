@@ -2,7 +2,7 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 
-use kurbo::{Affine as KurboAffine, Point as KurboPoint, Rect as KurboRect};
+use kurbo::{Affine as KurboAffine, Point as KurboPoint, Rect as KurboRect, Shape, Vec2};
 use wordcraft_doc::{Document, Pos, StoryRef};
 use wordcraft_layout::{
     DocLayout, LayoutCache, LayoutOptions, Placed, ViewMode,
@@ -183,16 +183,14 @@ impl WordDocument {
         let draws = page_display(&self.doc, p, &DisplayOptions::default());
         let mut raw = String::new();
         let mut char_rects = Vec::new();
-        let mut prev_y: Option<f64> = None;
-        let mut prev_right: Option<f64> = None;
+        let mut previous = None;
         collect_draws_text(
             &draws,
             KurboAffine::IDENTITY,
             None,
             &mut raw,
             &mut char_rects,
-            &mut prev_y,
-            &mut prev_right,
+            &mut previous,
         );
         build_cached_text(raw, char_rects)
     }
@@ -655,6 +653,64 @@ fn collect_draws_meta(
                 };
                 include_rect_bounds(bbox, min_x, min_y, max_x, max_y, page_w, page_h);
             }
+            Draw::Path {
+                segs,
+                fill,
+                stroke,
+                stroke_width,
+                ..
+            } => {
+                if fill.is_none() && stroke.is_none() {
+                    continue;
+                }
+                let path = wordcraft_layout::display::seg_path(segs);
+                if path.elements().is_empty() {
+                    continue;
+                }
+                let mut bbox = (transform * path).bounding_box();
+                if stroke.is_some() {
+                    // Match the renderer's round caps/joins and hairline width.
+                    let width = if stroke_width.is_finite() && *stroke_width > 0.0 {
+                        stroke_width.clamp(0.25, 200.0)
+                    } else {
+                        0.75
+                    };
+                    bbox = inflate_stroke_bounds(bbox, transform, width);
+                }
+                if let Some(bbox) = clipped_rect(bbox, clip) {
+                    include_rect_bounds(bbox, min_x, min_y, max_x, max_y, page_w, page_h);
+                }
+            }
+            Draw::Ink {
+                pts, width, alpha, ..
+            } => {
+                if *alpha <= 0.0 {
+                    continue;
+                }
+                // Keep exactly the usable points accepted by render::ink_path, including taps.
+                let mut points = pts
+                    .iter()
+                    .filter(|(x, y)| {
+                        x.is_finite() && y.is_finite() && x.abs() < 1e6 && y.abs() < 1e6
+                    })
+                    .map(|&(x, y)| transform * KurboPoint::new(f64::from(x), f64::from(y)));
+                let Some(first) = points.next() else {
+                    continue;
+                };
+                let bbox = points.fold(
+                    KurboRect::new(first.x, first.y, first.x, first.y),
+                    |bbox, point| bbox.union_pt(point),
+                );
+                let width = if width.is_finite() {
+                    width.clamp(0.25, 200.0)
+                } else {
+                    1.0
+                };
+                let bbox = inflate_stroke_bounds(bbox, transform, width);
+                if let Some(bbox) = clipped_rect(bbox, clip) {
+                    include_rect_bounds(bbox, min_x, min_y, max_x, max_y, page_w, page_h);
+                }
+            }
             Draw::Clip { rect, items } => {
                 let clip = DrawClip::new(wc_rect_to_kurbo(*rect), transform, clip);
                 collect_draws_meta(
@@ -731,6 +787,12 @@ fn collect_draws_meta(
             _ => {}
         }
     }
+}
+
+fn inflate_stroke_bounds(rect: KurboRect, transform: KurboAffine, width: f32) -> KurboRect {
+    let [a, b, c, d, _, _] = transform.as_coeffs();
+    let half = f64::from(width) * 0.5;
+    rect.inflate(half * a.hypot(c), half * b.hypot(d))
 }
 
 fn glyphs_bbox(
@@ -868,14 +930,20 @@ fn clipped_rect(mut rect: KurboRect, clip: Option<&DrawClip<'_>>) -> Option<Kurb
     (bounds.width() > 0.0 && bounds.height() > 0.0).then_some(bounds)
 }
 
+struct TextRunGeometry {
+    start: KurboPoint,
+    min_advance: f64,
+    max_advance: f64,
+    direction: Vec2,
+}
+
 fn collect_draws_text(
     draws: &[Draw],
     transform: KurboAffine,
     clip: Option<&DrawClip<'_>>,
     raw: &mut String,
     char_rects: &mut Vec<Option<KurboRect>>,
-    prev_y: &mut Option<f64>,
-    prev_right: &mut Option<f64>,
+    previous: &mut Option<TextRunGeometry>,
 ) {
     for draw in draws {
         match draw {
@@ -893,6 +961,10 @@ fn collect_draws_text(
                 let sz = f64::from((*size).max(1.0));
                 // Compute a rect per glyph, then map characters via `ranges`.
                 let mut glyph_rects = Vec::with_capacity(glyphs.len());
+                let mut geometry: Option<TextRunGeometry> = None;
+                let [a, b, c, d, _, _] = transform.as_coeffs();
+                let direction = Vec2::new(a, b).normalize();
+                let text_size = sz * c.hypot(d);
                 for (idx, &(gid, gx, gy)) in glyphs.iter().enumerate() {
                     let adv = glyphs
                         .get(idx + 1)
@@ -911,7 +983,23 @@ fn collect_draws_text(
                     let x1 = x0 + adv.max(1.0);
                     let y1 = f64::from(gy) + sz * 0.25;
                     let r = transform_rect_bbox(&transform, KurboRect::new(x0, y0, x1, y1));
-                    glyph_rects.push(clipped_rect(r, clip));
+                    let rect = clipped_rect(r, clip);
+                    if rect.is_some() {
+                        let start = transform * KurboPoint::new(x0, f64::from(gy));
+                        let end = transform * KurboPoint::new(x1, f64::from(gy));
+                        let left = start.to_vec2().dot(direction);
+                        let right = end.to_vec2().dot(direction);
+                        let geometry = geometry.get_or_insert(TextRunGeometry {
+                            start,
+                            min_advance: left,
+                            max_advance: right,
+                            direction,
+                        });
+                        // Logical glyph order can run backwards inside a bidi run.
+                        geometry.min_advance = geometry.min_advance.min(left).min(right);
+                        geometry.max_advance = geometry.max_advance.max(left).max(right);
+                    }
+                    glyph_rects.push(rect);
                 }
                 let Some(run_bbox) = glyph_rects
                     .iter()
@@ -921,14 +1009,19 @@ fn collect_draws_text(
                 else {
                     continue;
                 };
-                if let Some(py) = *prev_y {
-                    if (run_bbox.y0 - py).abs() > sz * 0.45 {
+                let Some(geometry) = geometry else {
+                    continue;
+                };
+                if let Some(prev) = previous.as_ref() {
+                    // Font size and clipping change a glyph's top, not its baseline.
+                    if (geometry.start - prev.start).cross(prev.direction).abs() > text_size * 0.45
+                        || geometry.direction.dot(prev.direction) < 0.99
+                    {
                         if !raw.ends_with('\n') && !raw.is_empty() {
                             raw.push('\n');
                             char_rects.push(None);
                         }
-                    } else if let Some(pr) = *prev_right
-                        && run_bbox.x0 - pr > sz * 0.22
+                    } else if geometry.min_advance - prev.max_advance > text_size * 0.22
                         && !raw.ends_with(char::is_whitespace)
                         && !text.starts_with(char::is_whitespace)
                     {
@@ -936,8 +1029,7 @@ fn collect_draws_text(
                         char_rects.push(None);
                     }
                 }
-                *prev_y = Some(run_bbox.y0);
-                *prev_right = Some(run_bbox.x1);
+                *previous = Some(geometry);
                 for (byte_offset, ch) in text.char_indices() {
                     // Keep hidden characters as separators, not searchable/highlightable text.
                     let rect = if ranges.len() == glyph_rects.len() && !ranges.is_empty() {
@@ -960,12 +1052,11 @@ fn collect_draws_text(
                     Some(&clip),
                     raw,
                     char_rects,
-                    prev_y,
-                    prev_right,
+                    previous,
                 );
             }
             Draw::Figure { draws: inner, .. } => {
-                collect_draws_text(inner, transform, clip, raw, char_rects, prev_y, prev_right);
+                collect_draws_text(inner, transform, clip, raw, char_rects, previous);
             }
             Draw::Turned {
                 x,
@@ -974,7 +1065,7 @@ fn collect_draws_text(
                 items: inner,
             } => {
                 let m = transform * affine_from_matrix(Draw::turn_matrix(*turn, *x, *y));
-                collect_draws_text(inner, m, clip, raw, char_rects, prev_y, prev_right);
+                collect_draws_text(inner, m, clip, raw, char_rects, previous);
             }
             Draw::Rotated {
                 cx,
@@ -983,7 +1074,7 @@ fn collect_draws_text(
                 items: inner,
             } => {
                 let m = transform * affine_from_matrix(spin.matrix(*cx, *cy));
-                collect_draws_text(inner, m, clip, raw, char_rects, prev_y, prev_right);
+                collect_draws_text(inner, m, clip, raw, char_rects, previous);
             }
             _ => {}
         }
@@ -1108,10 +1199,215 @@ mod tests {
             &mut raw,
             &mut rects,
             &mut None,
-            &mut None,
         );
         (raw, rects)
     }
+    #[test]
+    fn mixed_size_rtf_keeps_one_searchable_line_and_real_paragraph_breaks() {
+        let bytes = br"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs24 A{\fs48 B}{\fs24 C}D\par}";
+        let (doc, _, _) = WordDocument::load(Path::new("mixed.rtf"), bytes, "rtf").unwrap();
+        let cached = doc.extract_cached_text(0);
+        assert_eq!(cached.raw.trim(), "ABCD");
+        assert_eq!(cached.normalized.matches("abcd").count(), 1);
+        assert_eq!(cached.char_rects.len(), cached.raw.chars().count());
+        assert!(cached.char_rects.iter().all(Option::is_some));
+
+        let bytes = br"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs24 AB\par CD\par}";
+        let (doc, _, _) = WordDocument::load(Path::new("lines.rtf"), bytes, "rtf").unwrap();
+        let cached = doc.extract_cached_text(0);
+        assert_eq!(cached.raw.trim(), "AB\nCD");
+        assert!(!cached.normalized.contains("abcd"));
+        assert!(cached.normalized.contains("ab cd"));
+    }
+
+    #[test]
+    fn mixed_bidi_docx_run_edges_preserve_contiguous_search() {
+        for logical in ["Xאבגדה", "X אבגדה"] {
+            let mut source = Document::from_text(logical);
+            let Block::Para(para) = std::sync::Arc::make_mut(&mut source.body[0]) else {
+                panic!("paragraph")
+            };
+            para.runs = vec![
+                wordcraft_doc::Run {
+                    len: 1,
+                    props: CharProps {
+                        bold: Some(true),
+                        ..Default::default()
+                    },
+                },
+                wordcraft_doc::Run {
+                    len: logical.len() - 1,
+                    props: CharProps {
+                        bold: Some(false),
+                        ..Default::default()
+                    },
+                },
+            ];
+            let bytes = wordcraft_docx::write(&source).unwrap();
+            let (doc, _, _) =
+                WordDocument::load(Path::new("bidi.docx"), &bytes, "docx").unwrap();
+            let cached = doc.extract_cached_text(0);
+            assert_eq!(cached.raw.trim(), logical);
+            let query = logical.to_lowercase();
+            assert_eq!(cached.normalized.matches(query.as_str()).count(), 1);
+            assert_eq!(cached.char_rects.len(), cached.raw.chars().count());
+        }
+    }
+
+    #[test]
+    fn clipped_turned_mixed_size_text_uses_baselines_and_reading_direction() {
+        let mut large = glyphs("B", &[(5.0, 20.0)]);
+        let Draw::Glyphs { size, .. } = &mut large else {
+            unreachable!()
+        };
+        *size = 24.0;
+        let draws = [Draw::Turned {
+            x: 100.0,
+            y: 20.0,
+            turn: wordcraft_doc::props::TextDirection::Down,
+            items: vec![Draw::Clip {
+                rect: Rect::new(2.0, 10.0, 40.0, 50.0),
+                items: vec![
+                    glyphs("A", &[(0.0, 20.0)]),
+                    large,
+                    glyphs("C", &[(10.0, 20.0)]),
+                    glyphs("D", &[(0.0, 50.0)]),
+                ],
+            }],
+        }];
+        let (raw, rects) = text(&draws);
+        assert_eq!(raw, "ABC\nD");
+        assert_eq!(rects.len(), 5);
+        assert_eq!(rects[3], None);
+        assert!(rects.iter().flatten().all(|rect| {
+            rect.x0 >= 40.0 && rect.x1 <= 90.0 && rect.y0 >= 22.0 && rect.y1 <= 62.0
+        }));
+    }
+
+    #[test]
+    fn paths_and_ink_include_strokes_after_turning_and_clipping() {
+        use wordcraft_doc::graphic::PathSeg;
+        let path = Draw::Path {
+            segs: vec![
+                PathSeg::Move(10.0, 20.0),
+                PathSeg::Line(30.0, 20.0),
+                PathSeg::Line(30.0, 40.0),
+                PathSeg::Line(10.0, 40.0),
+                PathSeg::Close,
+            ],
+            fill: Some(Rgb(255, 0, 0)),
+            stroke: Some(Rgb(255, 0, 0)),
+            stroke_width: 4.0,
+            dash: Vec::new(),
+        };
+        let turned = |draw, clip| {
+            vec![Draw::Turned {
+                x: 100.0,
+                y: 50.0,
+                turn: wordcraft_doc::props::TextDirection::Down,
+                items: vec![Draw::Clip {
+                    rect: clip,
+                    items: vec![draw],
+                }],
+            }]
+        };
+        assert_eq!(
+            metadata(&turned(path, Rect::new(8.0, 18.0, 20.0, 20.0))).0,
+            [62.0, 58.0, 82.0, 78.0],
+        );
+        let ink = Draw::Ink {
+            pts: vec![(10.0, 30.0), (40.0, 30.0)],
+            color: Rgb(255, 0, 0),
+            width: 4.0,
+            alpha: 1.0,
+        };
+        assert_eq!(
+            metadata(&turned(ink, Rect::new(15.0, 20.0, 20.0, 20.0))).0,
+            [68.0, 65.0, 72.0, 85.0],
+        );
+        let tap = Draw::Ink {
+            pts: vec![(f32::NAN, 0.0), (20.0, 30.0), (1e6, 1e6)],
+            color: Rgb(255, 0, 0),
+            width: 10.0,
+            alpha: 1.0,
+        };
+        assert_eq!(metadata(&[tap.clone()]).0, [15.0, 25.0, 25.0, 35.0]);
+        assert!(
+            metadata(&turned(tap, Rect::new(50.0, 50.0, 10.0, 10.0)))
+                .0
+                .iter()
+                .all(|v| !v.is_finite())
+        );
+    }
+
+    #[test]
+    fn freeform_docx_bounds_enclose_rendered_pixels() {
+        use std::sync::Arc;
+        use wordcraft_doc::{
+            InlineObject,
+            freeform::{FreePath, Freeform},
+            para::{Anchor, Float, ShapeKind, Wrap},
+        };
+        for closed in [true, false] {
+            let mut source = Document::from_text("Caption");
+            let shape = InlineObject::Shape {
+                kind: ShapeKind::Freeform,
+                w: 200.0,
+                h: 100.0,
+                fill: closed.then_some(Rgb(255, 0, 0)),
+                stroke: Some(Rgb(255, 0, 0)),
+                stroke_width: 4.0,
+                float: Float {
+                    wrap: Wrap::InFrontOfText,
+                    h_rel: Anchor::Page,
+                    v_rel: Anchor::Page,
+                    x: 300.0,
+                    y: 400.0,
+                    ..Default::default()
+                },
+                story: None,
+                freeform: Some(Arc::new(Freeform {
+                    w: 200.0,
+                    h: 100.0,
+                    paths: vec![FreePath {
+                        pts: vec![[0.0, 0.0], [200.0, 0.0], [200.0, 100.0], [0.0, 100.0]],
+                        closed,
+                    }],
+                    ..Default::default()
+                })),
+                effects: Default::default(),
+                extra: Default::default(),
+            };
+            source
+                .insert_object(&Pos::body(0, 0), shape, &Default::default())
+                .unwrap();
+            let bytes = wordcraft_docx::write(&source).unwrap();
+            let (doc, _, _) =
+                WordDocument::load(Path::new("freeform.docx"), &bytes, "docx").unwrap();
+            let bounds = doc.content_bounds(0);
+            let (width, height, scale, pixels) = doc.render_page_rgba(0, 612, 792);
+            let (page_w, page_h) = doc.page_size(0);
+            let mut red_pixels = 0;
+            for (i, rgba) in pixels.chunks_exact(4).enumerate() {
+                if rgba[0] > 200 && rgba[1] < 50 && rgba[2] < 50 {
+                    red_pixels += 1;
+                    let x = (i % width as usize) as f64 / scale / page_w;
+                    let y = (i / width as usize) as f64 / scale / page_h;
+                    assert!(
+                        x >= f64::from(bounds[0])
+                            && x <= f64::from(bounds[2])
+                            && y >= f64::from(bounds[1])
+                            && y <= f64::from(bounds[3]),
+                        "red pixel ({x}, {y}) outside {bounds:?}, closed={closed}",
+                    );
+                }
+            }
+            assert_eq!(pixels.len(), width as usize * height as usize * 4);
+            assert!(red_pixels > 100, "the freeform must actually render");
+            assert!(bounds[2] > 0.8 && bounds[3] > 0.6);
+        }
+    }
+
 
     #[test]
     fn nested_clips_trim_links_images_bounds_and_text() {
@@ -1199,6 +1495,24 @@ mod tests {
                             h: 2.0,
                         }),
                         glyphs("A", &[(36.5, 38.5)]),
+                        Draw::Ink {
+                            pts: vec![(37.0, 37.0)],
+                            color: Rgb(255, 0, 0),
+                            width: 1.0,
+                            alpha: 1.0,
+                        },
+                        Draw::Path {
+                            segs: vec![
+                                wordcraft_doc::graphic::PathSeg::Move(36.5, 36.5),
+                                wordcraft_doc::graphic::PathSeg::Line(38.5, 36.5),
+                                wordcraft_doc::graphic::PathSeg::Line(38.5, 38.5),
+                                wordcraft_doc::graphic::PathSeg::Close,
+                            ],
+                            fill: Some(Rgb(255, 0, 0)),
+                            stroke: Some(Rgb(255, 0, 0)),
+                            stroke_width: 1.0,
+                            dash: Vec::new(),
+                        },
                     ],
                 }],
             }],

@@ -394,6 +394,7 @@ fn merge_shallow(a: Arg) -> Arg {
             && prev.size == r.size
             && prev.color == r.color
             && prev.font == r.font
+            && r.brk.is_none()
         {
             prev.text.push_str(&r.text);
             continue;
@@ -1154,6 +1155,19 @@ pub fn set_limits(nodes: &mut Arg, loc: Option<LimLoc>) {
 mod tests {
     use super::*;
     use crate::math::parse_linear;
+
+    #[test]
+    fn tidy_preserves_manual_break_alignment() {
+        let mut eq = vec![
+            MNode::Run(MRun { text: "a=b".into(), ..Default::default() }),
+            MNode::Run(MRun { text: "+c".into(), brk: Some(0), ..Default::default() }),
+            MNode::Run(MRun { text: "+d".into(), ..Default::default() }),
+        ];
+        tidy(&mut eq);
+        assert_eq!(eq.len(), 2);
+        assert!(matches!(&eq[0], MNode::Run(r) if r.text == "a=b" && r.brk.is_none()));
+        assert!(matches!(&eq[1], MNode::Run(r) if r.text == "+c+d" && r.brk == Some(0)));
+    }
 
     fn lin(a: &Arg) -> String {
         to_linear(a)

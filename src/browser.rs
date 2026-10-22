@@ -130,7 +130,7 @@ impl BrowserState {
                     is_dir: true,
                     is_recent: false,
                 });
-            } else if is_presentation(&entry.path()) {
+            } else if is_presentation(&entry.path()) && entry.path().is_file() {
                 files.push(BrowserEntry {
                     name,
                     path: entry.path(),
@@ -221,7 +221,7 @@ impl BrowserState {
             if let Ok(read_dir) = std::fs::read_dir(&directory) {
                 for entry in read_dir
                     .flatten()
-                    .filter(|entry| is_presentation(&entry.path()))
+                    .filter(|entry| entry.path().is_file() && is_presentation(&entry.path()))
                 {
                     if op.check().is_err() {
                         return;
@@ -562,7 +562,7 @@ fn collect_presentation_files_recursive(
         };
         if file_type.is_dir() {
             collect_presentation_files_recursive(&entry.path(), root, depth + 1, op, files);
-        } else if is_presentation(&entry.path()) {
+        } else if is_presentation(&entry.path()) && entry.path().is_file() {
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap_or(&path);
             files.push((relative.to_string_lossy().into_owned(), path));
@@ -706,6 +706,33 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, recent);
         assert!(matches[0].is_recent);
+    }
+
+    #[test]
+    fn recursive_filter_excludes_document_directories_and_broken_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path();
+        let document_dir = root.join("reports.docx");
+        fs::create_dir(&document_dir).expect("document-named directory");
+        fs::write(root.join("real.docx"), b"synthetic").expect("document");
+        symlink("real.docx", root.join("linked.docx")).expect("document symlink");
+        symlink("reports.docx", root.join("folder.docx")).expect("directory symlink");
+        symlink("missing.docx", root.join("broken.docx")).expect("broken symlink");
+        let mut browser = BrowserState::new(root.to_path_buf());
+        assert!(
+            browser.entries.iter().any(|entry| entry.path == document_dir && entry.is_dir)
+        );
+
+        browser.preload_recursive();
+        wait_for_recursive_scan(&mut browser);
+        browser.filter = "docx".to_string();
+        browser.rebuild_filter();
+        let entries: Vec<_> = browser.filtered_entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.path.is_file() && !entry.is_dir));
+        assert!(entries.iter().any(|entry| entry.path == root.join("linked.docx")));
     }
 
     #[test]

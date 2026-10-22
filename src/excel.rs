@@ -83,8 +83,8 @@ impl ExcelDocument {
         let file_path = path.to_string_lossy().to_string();
         let (mut wb, _) =
             gridcraft_engine::io::open_bytes(&file_name, bytes).map_err(|e| e.to_string())?;
-        let mut calc = gridcraft_engine::calc::Calc::new();
-        calc.recalc_all(&mut wb);
+        // Keep saved values and formula metadata; calculate only missing caches.
+        gridcraft_engine::calc::Calc::new().recalc_missing(&mut wb);
 
         let opts = PrintOptions::default();
         let mut layouts = Vec::new();
@@ -103,6 +103,7 @@ impl ExcelDocument {
                 continue;
             };
             let sh = &wb.sheets[si];
+            complete_layout_bands(sh, &mut lay);
             lay.settings.gridlines = sh.show_gridlines || sh.print.gridlines;
             let mut sheet_specs = Vec::new();
             for &(ri, ci) in &lay.pages {
@@ -812,6 +813,55 @@ impl ExcelDocument {
             }
         }
         first_sheet_page
+    }
+}
+
+
+// The export API caps bands before we can prune empty pages. Rebuild the
+// geometry without that export-only cap; only populated bands become pages.
+fn complete_layout_bands(sh: &Sheet, lay: &mut SheetLayout) {
+    let (aw, ah) = layout_avail(lay);
+    let k = layout_k(lay);
+    let bands = |start: u32, end: u32, rows: bool, room: f32, heading: f32,
+                 titles: Option<(u32, u32)>| {
+        let size = |n| if rows { sh.row_height(n) } else { sh.col_width(n) };
+        let available = |start| {
+            let repeated: f32 = titles.filter(|(a, _)| *a < start)
+                .map(|(a, b)| (a..=b.min(start - 1)).map(size).sum())
+                .unwrap_or(0.0);
+            (room / k - heading - repeated).max(1.0)
+        };
+        let mut result = Vec::new();
+        let mut first = start;
+        let mut used = 0.0;
+        let mut room = available(first);
+        for line in start..=end {
+            let width = size(line);
+            let breaks = if rows { &lay.settings.row_breaks } else { &lay.settings.col_breaks };
+            if line > first && (used + width > room + 0.01
+                || (lay.manual_breaks && breaks.contains(&line)))
+            {
+                result.push((first, line - 1));
+                first = line;
+                used = 0.0;
+                room = available(first);
+            }
+            used += width;
+        }
+        result.push((first, end));
+        result
+    };
+    let rows = bands(lay.area.start.row, lay.area.end.row, true, ah, lay.heading_h, lay.title_rows);
+    let cols = bands(lay.area.start.col, lay.area.end.col, false, aw, lay.heading_w, lay.title_cols);
+    lay.row_bands = rows;
+    lay.col_bands = cols;
+    lay.pages.clear();
+    for (ci, &cols) in lay.col_bands.iter().enumerate() {
+        for (ri, &rows) in lay.row_bands.iter().enumerate() {
+            if trim_band_rows(sh, rows, cols).is_some() {
+                lay.pages.push((ri, ci));
+            }
+        }
     }
 }
 
@@ -1852,10 +1902,7 @@ fn font_for(style: &Style) -> FontSpec<'_> {
     }
 }
 
-fn block_cells(wb: &Workbook, sh: &Sheet, block: RangeRef) -> Vec<CellRef> {
-    if block.count() <= DENSE_BLOCK {
-        return block.iter().collect();
-    }
+fn block_cells(_wb: &Workbook, sh: &Sheet, block: RangeRef) -> Vec<CellRef> {
     let mut cells: Vec<CellRef> = sh.cells.iter_range(block).map(|(c, _)| c).collect();
     cells.extend(
         sh.spill
@@ -1869,59 +1916,170 @@ fn block_cells(wb: &Workbook, sh: &Sheet, block: RangeRef) -> Vec<CellRef> {
             .copied()
             .filter(|c| block.contains(*c)),
     );
-    let paints_blank = |style: &Style| {
-        style.fill.pattern != PatternType::None || style.borders != Borders::default()
-    };
-    let visible_style = |id| paints_blank(wb.styles.get(id));
-    // Only expand formatting sources intersecting this block, not its unstyled grid.
-    let mut add_range = |range: RangeRef| {
-        if let Some(range) = range.intersection(&block) {
-            cells.extend(range.iter());
-        }
-    };
-    for (&row, info) in sh.rows.range(block.start.row..=block.end.row) {
-        if info.style.is_some_and(&visible_style) {
-            add_range(RangeRef::new(
-                CellRef::new(row, block.start.col),
-                CellRef::new(row, block.end.col),
-            ));
-        }
-    }
-    for (&col, info) in sh.cols.range(block.start.col..=block.end.col) {
-        if info.style.is_some_and(&visible_style) {
-            add_range(RangeRef::new(
-                CellRef::new(block.start.row, col),
-                CellRef::new(block.end.row, col),
-            ));
-        }
-    }
-    for format in &sh.cond_formats {
-        use gridcraft_engine::model::CfRule;
-        let style = match &format.rule {
-            CfRule::CellIs { style, .. }
-            | CfRule::Expression { style, .. }
-            | CfRule::ContainsText { style, .. }
-            | CfRule::NotContainsText { style, .. }
-            | CfRule::BeginsWith { style, .. }
-            | CfRule::EndsWith { style, .. }
-            | CfRule::Blanks { style }
-            | CfRule::NoErrors { style } => Some(style),
-            // The remaining rules cannot paint an unstored blank.
-            _ => None,
-        };
-        if !style.is_some_and(|style| paints_blank(style)) {
-            continue;
-        }
-        for &range in &format.ranges {
-            add_range(range);
-        }
-    }
-    for table in &sh.tables {
-        add_range(table.range);
-    }
     cells.sort_unstable();
     cells.dedup();
     cells
+}
+
+// Partition blank formatting at semantic boundaries, not at every cell. Constant
+// blank rules and row/column fills stay rectangles even on subpixel-sized grids.
+// Relative formulas and table banding still get their actual per-cell semantics.
+fn visit_blank_formats(
+    b: &Block<'_>, cells: &[CellRef], merges: &[RangeRef],
+    cf: &mut Option<CfCache>, mut paint: impl FnMut(RangeRef, Look),
+) {
+    use gridcraft_engine::model::CfRule;
+    let sh = b.sh;
+    let block = b.range();
+    let paints = |style: &Style| {
+        style.fill.pattern != PatternType::None || style.borders != Borders::default()
+    };
+    let mut sources = Vec::new();
+    for (&row, info) in sh.rows.range(b.rows.0..=b.rows.1) {
+        if info.style.is_some_and(|id| paints(b.wb.styles.get(id))) {
+            sources.push(RangeRef::new(CellRef::new(row, b.cols.0), CellRef::new(row, b.cols.1)));
+        }
+    }
+    for (&col, info) in sh.cols.range(b.cols.0..=b.cols.1) {
+        if info.style.is_some_and(|id| paints(b.wb.styles.get(id))) {
+            sources.push(RangeRef::new(CellRef::new(b.rows.0, col), CellRef::new(b.rows.1, col)));
+        }
+    }
+    for format in &sh.cond_formats {
+        let style = match &format.rule {
+            CfRule::CellIs { style, .. } | CfRule::Expression { style, .. }
+            | CfRule::ContainsText { style, .. } | CfRule::NotContainsText { style, .. }
+            | CfRule::BeginsWith { style, .. } | CfRule::EndsWith { style, .. }
+            | CfRule::Blanks { style } | CfRule::NoErrors { style } => Some(style),
+            _ => None,
+        };
+        if style.is_some_and(|style| paints(style)) {
+            sources.extend(format.ranges.iter().filter_map(|r| r.intersection(&block)));
+        }
+    }
+    sources.extend(sh.tables.iter().filter_map(|t| t.range.intersection(&block)));
+    if sources.is_empty() {
+        return;
+    }
+    let mut rows = vec![b.rows.0, b.rows.1 + 1];
+    let mut cols = vec![b.cols.0, b.cols.1 + 1];
+    let mut boundary = |r: RangeRef| {
+        if let Some(r) = r.intersection(&block) {
+            rows.extend([r.start.row, r.end.row + 1]);
+            cols.extend([r.start.col, r.end.col + 1]);
+        }
+    };
+    for &r in &sources { boundary(r); }
+    for &c in cells { boundary(RangeRef::cell(c)); }
+    for &r in merges { boundary(r); }
+    // Include nonpainting styles/rules too: they can override a painting source.
+    for &row in sh.rows.range(b.rows.0..=b.rows.1).map(|(r, _)| r) {
+        boundary(RangeRef::new(CellRef::new(row, b.cols.0), CellRef::new(row, b.cols.1)));
+    }
+    for &col in sh.cols.range(b.cols.0..=b.cols.1).map(|(c, _)| c) {
+        boundary(RangeRef::new(CellRef::new(b.rows.0, col), CellRef::new(b.rows.1, col)));
+    }
+    for format in &sh.cond_formats {
+        for &r in &format.ranges { boundary(r); }
+    }
+    for table in &sh.tables {
+        if let Some(r) = table.range.intersection(&block) {
+            boundary(r);
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    cols.sort_unstable();
+    cols.dedup();
+    for rr in rows.windows(2) {
+        if b.y(rr[1]) <= b.y(rr[0]) { continue; }
+        for cc in cols.windows(2) {
+            if b.x(cc[1]) <= b.x(cc[0]) { continue; }
+            let r = RangeRef::new(CellRef::new(rr[0], cc[0]), CellRef::new(rr[1] - 1, cc[1] - 1));
+            if !sources.iter().any(|s| s.intersects(&r))
+                || cells.binary_search(&r.start).is_ok()
+                || merges.iter().any(|m| m.contains(r.start))
+            {
+                continue;
+            }
+            let varying = sh.tables.iter().any(|t| t.range.intersects(&r))
+                || sh.cond_formats.iter().any(|f| {
+                    matches!(f.rule, CfRule::Expression { .. } | CfRule::CellIs { .. })
+                        && f.ranges.iter().any(|a| a.intersects(&r))
+                });
+            if varying {
+                for c in r.iter() {
+                    if sh.row_height(c.row) > 0.0 && sh.col_width(c.col) > 0.0 {
+                        paint(RangeRef::cell(c), cell_look(b.wb, b.si, sh, c, cf));
+                    }
+                }
+            } else {
+                paint(r, cell_look(b.wb, b.si, sh, r.start, cf));
+            }
+        }
+    }
+}
+
+fn draw_blank_formats(
+    pg: &mut PageCanvas, b: &Block<'_>, cells: &[CellRef], merges: &[RangeRef],
+    cf: &mut Option<CfCache>, borders: bool,
+) {
+    visit_blank_formats(b, cells, merges, cf, |r, l| {
+        let (x, y, w, h) = b.rect(r);
+        if !borders {
+            if let Some(fill) = l.fill { pg.fill_rect(x, y, w, h, fill); }
+            return;
+        }
+        let bd = &l.style.borders;
+        if *bd == Borders::default() { return; }
+        // Dashed edges restart their pattern at each cell, as do diagonals.
+        let per_cell = [&bd.top, &bd.bottom, &bd.left, &bd.right].iter().any(|edge| {
+            matches!(edge.style, BorderStyle::Dashed | BorderStyle::MediumDashed
+                | BorderStyle::Dotted | BorderStyle::Hair | BorderStyle::DashDot
+                | BorderStyle::MediumDashDot | BorderStyle::SlantDashDot
+                | BorderStyle::DashDotDot | BorderStyle::MediumDashDotDot)
+        }) || !bd.diag_down.is_none() || !bd.diag_up.is_none();
+        if per_cell {
+            for c in r.iter() {
+                let (x, y, w, h) = b.rect(RangeRef::cell(c));
+                if w <= 0.0 || h <= 0.0 { continue; }
+                draw_border(pg, &bd.top, b.wb, x, y, x + w, y, b.k);
+                draw_border(pg, &bd.bottom, b.wb, x, y + h, x + w, y + h, b.k);
+                draw_border(pg, &bd.left, b.wb, x, y, x, y + h, b.k);
+                draw_border(pg, &bd.right, b.wb, x + w, y, x + w, y + h, b.k);
+                draw_border(pg, &bd.diag_down, b.wb, x, y, x + w, y + h, b.k);
+                draw_border(pg, &bd.diag_up, b.wb, x, y + h, x + w, y, b.k);
+            }
+            return;
+        }
+        for row in r.start.row..=r.end.row {
+            if b.sh.row_height(row) <= 0.0 { continue; }
+            let (y0, y1) = (b.y(row), b.y(row + 1));
+            draw_border(pg, &bd.top, b.wb, x, y0, x + w, y0, b.k);
+            draw_border(pg, &bd.bottom, b.wb, x, y1, x + w, y1, b.k);
+        }
+        for col in r.start.col..=r.end.col {
+            if b.sh.col_width(col) <= 0.0 { continue; }
+            let (x0, x1) = (b.x(col), b.x(col + 1));
+            draw_border(pg, &bd.left, b.wb, x0, y, x0, y + h, b.k);
+            draw_border(pg, &bd.right, b.wb, x1, y, x1, y + h, b.k);
+        }
+    });
+}
+
+// Overlapping opaque grid strokes cover one continuous strip. Painting their
+// union keeps tiny/hidden row grids from creating a primitive for every row.
+fn visit_gridline_runs(positions: &[f32], width: f32, mut paint: impl FnMut(f32, f32)) {
+    let Some((&first, rest)) = positions.split_first() else { return; };
+    let (mut start, mut end) = (first, first);
+    for &position in rest {
+        if position - end > width {
+            paint(start, end);
+            start = position;
+        }
+        end = position;
+    }
+    paint(start, end);
 }
 
 fn draw_block(
@@ -1957,13 +2115,14 @@ fn draw_block(
     if gridlines {
         let grey = [0xB0, 0xB0, 0xB0];
         let lw = (0.35 * b.scale).clamp(0.1, 0.5);
-        for x in &b.xs {
-            pg.stroke_line(*x, by, *x, by + bh, lw, grey);
-        }
-        for y in &b.ys {
-            pg.stroke_line(bx, *y, bx + bw, *y, lw, grey);
-        }
+        visit_gridline_runs(&b.xs, lw, |start, end| {
+            pg.fill_rect(start - lw / 2.0, by, end - start + lw, bh, grey);
+        });
+        visit_gridline_runs(&b.ys, lw, |start, end| {
+            pg.fill_rect(bx, start - lw / 2.0, bw, end - start + lw, grey);
+        });
     }
+    draw_blank_formats(pg, b, &cells, &merges, cf, false);
     let skip = |c: &CellRef| {
         sh.cond_formats.is_empty()
             && sh.value_ref(*c).is_none_or(|v| v.is_empty())
@@ -2023,6 +2182,7 @@ fn draw_block(
             pg.fill_rect(x + pad, y + pad, bwid, (h - 2.0 * pad).max(0.0), rgb);
         }
     }
+    draw_blank_formats(pg, b, &cells, &merges, cf, true);
     for (c, l) in &looks {
         let (x, y, w, h, merged) = rect_of(*c);
         if w <= 0.0 || h <= 0.0 {
@@ -2110,6 +2270,139 @@ fn center_across_width(styles: &StyleTable, sh: &Sheet, c: CellRef, merges: &[Ra
     ext
 }
 
+// Vector shapes do not depend on font glyph coverage. CfCache has already
+// applied thresholds and reversal; index zero is the lowest-value icon.
+fn draw_cf_icon(pg: &mut PageCanvas, set: &str, index: usize, rect: (f32, f32, f32)) {
+    let (x, y, s) = rect;
+    let n = gridcraft_engine::cf::icon_count(set);
+    let i = index.min(n - 1);
+    let red = [209, 59, 47];
+    let yellow = [242, 184, 46];
+    let green = [46, 158, 79];
+    let grey = [100, 100, 100];
+    let color = if set.ends_with("Gray") { grey }
+        else if i == 0 { red } else if i + 1 == n { green } else { yellow };
+    let p = |u: f32, v: f32| [x + u * s, y + v * s];
+    let polygon = |pg: &mut PageCanvas, points: &[[f32; 2]], fill, stroke| {
+        let points: Vec<_> = points.iter().map(|q| p(q[0], q[1])).collect();
+        pg.polygon(&points, fill, stroke);
+    };
+    let circle = |pg: &mut PageCanvas, fill, stroke| {
+        pg.circle(x + s * 0.5, y + s * 0.5, s * 0.43, fill, stroke);
+    };
+    let line = |pg: &mut PageCanvas, a: [f32; 2], b: [f32; 2], width, color| {
+        let (a, b) = (p(a[0], a[1]), p(b[0], b[1]));
+        pg.stroke_line(a[0], a[1], b[0], b[1], s * width, color);
+    };
+    match set {
+        "3Arrows" | "3ArrowsGray" | "4Arrows" | "4ArrowsGray" | "5Arrows" | "5ArrowsGray" => {
+            let angle: f32 = match n {
+                3 => [180.0, 90.0, 0.0][i],
+                4 => [180.0, 135.0, 45.0, 0.0][i],
+                _ => 180.0 - i as f32 * 45.0,
+            } * std::f32::consts::PI / 180.0;
+            let (sn, cs) = angle.sin_cos();
+            let points = [[0.5, 0.05], [0.95, 0.5], [0.67, 0.5], [0.67, 0.95],
+                [0.33, 0.95], [0.33, 0.5], [0.05, 0.5]]
+                .map(|[u, v]| [0.5 + (u - 0.5) * cs - (v - 0.5) * sn,
+                    0.5 + (u - 0.5) * sn + (v - 0.5) * cs]);
+            polygon(pg, &points, Some(color), Some(([70, 70, 70], s * 0.025)));
+        }
+        "3Flags" => {
+            line(pg, [0.2, 0.1], [0.2, 0.95], 0.07, grey);
+            polygon(pg, &[[0.23, 0.1], [0.9, 0.15], [0.75, 0.4], [0.9, 0.6], [0.23, 0.55]], Some(color), None);
+        }
+        "3TrafficLights1" | "3TrafficLights2" | "4TrafficLights" => {
+            if set == "3TrafficLights2" {
+                pg.fill_rect(x + s * 0.05, y, s * 0.9, s, [45, 45, 45]);
+            }
+            let color = if n == 4 { [[35, 35, 35], red, yellow, green][i] } else { color };
+            circle(pg, Some(color), Some(([65, 65, 65], s * 0.055)));
+        }
+        "3Signs" => match i {
+            0 => polygon(pg, &[[0.5, 0.02], [0.98, 0.5], [0.5, 0.98], [0.02, 0.5]], Some(red), Some((grey, s * 0.04))),
+            1 => polygon(pg, &[[0.5, 0.03], [0.98, 0.92], [0.02, 0.92]], Some(yellow), Some((grey, s * 0.04))),
+            _ => circle(pg, Some(green), Some((grey, s * 0.04))),
+        },
+        "3Symbols" | "3Symbols2" => {
+            let ink = if set == "3Symbols" {
+                circle(pg, Some(color), None);
+                [255, 255, 255]
+            } else { color };
+            match i {
+                0 => {
+                    line(pg, [0.27, 0.27], [0.73, 0.73], 0.13, ink);
+                    line(pg, [0.27, 0.73], [0.73, 0.27], 0.13, ink);
+                }
+                1 => {
+                    line(pg, [0.5, 0.2], [0.5, 0.58], 0.13, ink);
+                    pg.circle(x + s * 0.5, y + s * 0.77, s * 0.07, Some(ink), None);
+                }
+                _ => {
+                    line(pg, [0.22, 0.5], [0.43, 0.72], 0.13, ink);
+                    line(pg, [0.43, 0.72], [0.79, 0.25], 0.13, ink);
+                }
+            }
+        }
+        "4RedToBlack" => circle(pg, Some([[30, 30, 30], [110, 55, 55], [180, 90, 90], red][i]), None),
+        "4Rating" | "5Rating" => {
+            for bar in 0..n - 1 {
+                let height = (bar + 1) as f32 / (n - 1) as f32 * s * 0.85;
+                let width = s * 0.8 / (n - 1) as f32;
+                pg.fill_rect(x + s * 0.1 + bar as f32 * width, y + s * 0.95 - height,
+                    width * 0.75, height, if bar < i { [65, 95, 140] } else { [205, 205, 205] });
+            }
+        }
+        "5Quarters" => {
+            circle(pg, Some([255, 255, 255]), None);
+            if i > 0 {
+                let mut points = vec![[0.5, 0.5]];
+                for step in 0..=i * 12 {
+                    let a = step as f32 / 48.0 * std::f32::consts::TAU;
+                    points.push([0.5 + 0.43 * a.sin(), 0.5 - 0.43 * a.cos()]);
+                }
+                polygon(pg, &points, Some([45, 45, 45]), None);
+            }
+            circle(pg, None, Some(([45, 45, 45], s * 0.055)));
+        }
+        "3Stars" => {
+            let points: Vec<_> = (0..10).map(|j| {
+                let a = j as f32 * std::f32::consts::PI / 5.0;
+                let r = if j % 2 == 0 { 0.48 } else { 0.21 };
+                [0.5 + r * a.sin(), 0.5 - r * a.cos()]
+            }).collect();
+            polygon(pg, &points, Some([255, 255, 255]), None);
+            if i > 0 {
+                pg.push_clip(x, y, s * i as f32 / 2.0, s);
+                polygon(pg, &points, Some(yellow), None);
+                pg.pop_clip();
+            }
+            polygon(pg, &points, None, Some((grey, s * 0.04)));
+        }
+        "3Triangles" if i == 1 => {
+            pg.fill_rect(x + s * 0.1, y + s * 0.4, s * 0.8, s * 0.2, yellow);
+        }
+        "3Triangles" => {
+            let points = if i == 0 {
+                [[0.5, 0.95], [0.05, 0.1], [0.95, 0.1]]
+            } else {
+                [[0.5, 0.05], [0.95, 0.9], [0.05, 0.9]]
+            };
+            polygon(pg, &points, Some(color), None);
+        }
+        "5Boxes" => {
+            for j in 0..4 {
+                let u = 0.08 + (j % 2) as f32 * 0.46;
+                let v = 0.08 + (j / 2) as f32 * 0.46;
+                pg.fill_rect(x + s * u, y + s * v, s * 0.38, s * 0.38,
+                    if j < i { [65, 95, 140] } else { [240, 240, 240] });
+                pg.rect_stroke(x + s * u, y + s * v, s * 0.38, s * 0.38, s * 0.035, grey);
+            }
+        }
+        _ => circle(pg, Some(color), Some((grey, s * 0.04))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     pg: &mut PageCanvas,
@@ -2121,10 +2414,22 @@ fn draw_text(
     merges: &[RangeRef],
     limits: (f32, f32),
 ) {
-    let (x, y, w, h) = rect;
+    let (mut x, y, mut w, h) = rect;
     let sh = b.sh;
     let wb = b.wb;
     let v = sh.value(c);
+    if let Some((set, index)) = l.cf.as_ref().and_then(|cf| cf.icon.as_ref()) {
+        let pad = PAD_PX * b.k;
+        let side = (16.0 * b.k).min((h - 2.0 * pad).max(0.0)).min((w - 2.0 * pad).max(0.0));
+        if side > 0.0 {
+            pg.push_clip(x, y, w, h);
+            draw_cf_icon(pg, set, *index, (x + pad, y + (h - side) / 2.0, side));
+            pg.pop_clip();
+            let reserved = side + pad;
+            x += reserved;
+            w = (w - reserved).max(0.0);
+        }
+    }
     if v.is_empty() || l.cf.as_ref().is_some_and(|cf| cf.hide_value) {
         return;
     }
@@ -2354,15 +2659,7 @@ fn decode_cached_pixmap(data: &[u8], image_cache: &mut ImageCache) -> Option<Cac
     }
 
     let decoded = (|| {
-        let (w, h) = gridcraft_engine::io::image_size(data)?;
-        if w == 0
-            || h == 0
-            || w > MAX_DECODE_IMAGE_DIM
-            || h > MAX_DECODE_IMAGE_DIM
-            || u64::from(w) * u64::from(h) > MAX_DECODE_IMAGE_PIXELS
-        {
-            return None;
-        }
+        use image::ImageDecoder;
         let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
             .with_guessed_format()
             .ok()?;
@@ -2371,7 +2668,15 @@ fn decode_cached_pixmap(data: &[u8], image_cache: &mut ImageCache) -> Option<Cac
         limits.max_image_height = Some(MAX_DECODE_IMAGE_DIM);
         limits.max_alloc = Some(MAX_DECODE_IMAGE_ALLOC);
         reader.limits(limits);
-        let img = reader.decode().ok()?;
+        let decoder = reader.into_decoder().ok()?;
+        let (w, h) = decoder.dimensions();
+        if w == 0 || h == 0
+            || u64::from(w) * u64::from(h) > MAX_DECODE_IMAGE_PIXELS
+            || decoder.total_bytes() > MAX_DECODE_IMAGE_ALLOC
+        {
+            return None;
+        }
+        let img = image::DynamicImage::from_decoder(decoder).ok()?;
         let (iw, ih) = (img.width(), img.height());
         if iw == 0 || ih == 0 {
             return None;
@@ -2826,10 +3131,12 @@ mod tests {
         for gridlines in [false, true] {
             let dense = render(49, gridlines);
             let sparse = render(99, gridlines);
-            assert!(
-                sparse == dense,
-                "dense and sparse interior pixels differ, gridlines: {gridlines}"
-            );
+            let differences: Vec<_> = sparse.chunks_exact(4).zip(dense.chunks_exact(4))
+                .enumerate().filter(|(_, (a, b))| a != b)
+                .take(12).map(|(i, (a, b))| (i % VIEW_SIZE, i / VIEW_SIZE, a, b))
+                .collect();
+            assert!(differences.is_empty(),
+                "dense and sparse interior pixels differ, gridlines: {gridlines}: {differences:?}");
             for (x, y, rgb) in [
                 (4, 31, [20, 40, 200]),
                 (64, 4, [20, 180, 40]),
@@ -3066,5 +3373,261 @@ mod tests {
         oversized_png[16..20].copy_from_slice(&20_000u32.to_be_bytes());
         oversized_png[20..24].copy_from_slice(&20_000u32.to_be_bytes());
         assert!(decode_cached_pixmap(&oversized_png, &mut cache).is_none());
+    }
+    fn load_book(wb: &Workbook) -> ExcelDocument {
+        let bytes = gridcraft_xlsx::write_xlsx(wb).unwrap();
+        ExcelDocument::load(Path::new("regression.xlsx"), &bytes).unwrap().0
+    }
+
+    #[test]
+    fn sparse_pagination_keeps_last_excel_row_and_more_than_export_page_limit() {
+        use gridcraft_engine::core::MAX_ROWS;
+        let mut wb = Workbook::new();
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        sh.set_value(CellRef::new(0, 0), Value::from("TopSentinel"));
+        sh.set_value(CellRef::new(MAX_ROWS - 1, 0), Value::from("BottomSentinel"));
+        let doc = load_book(&wb);
+        assert_eq!(doc.page_count(), 2);
+        assert!(doc.extract_cached_text(0).raw.contains("TopSentinel"));
+        assert!(doc.extract_cached_text(1).raw.contains("BottomSentinel"));
+        assert!(doc.render_page_rgba(1, 792, 612).3.chunks_exact(4)
+            .any(|pixel| pixel[0..3] != [255, 255, 255]));
+
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        sh.cells = Default::default();
+        sh.default_row_height = 1_000.0;
+        for row in 0..2_005 {
+            sh.set_value(CellRef::new(row, 0), Value::from(format!("Sentinel{row}")));
+        }
+        let doc = load_book(&wb);
+        assert_eq!(doc.page_count(), 2_005);
+        assert!(doc.extract_cached_text(2_004).raw.contains("Sentinel2004"));
+    }
+
+    #[test]
+    fn saved_formula_results_survive_and_only_missing_results_are_calculated() {
+        use gridcraft_engine::model::{Cell, Formula};
+        let mut wb = Workbook::new();
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        for (row, formula, value) in [(0, "UNSUPPORTED_UDF()", Value::Number(42.0)),
+            (1, "A1*2", Value::Number(84.0)), (2, "A2+1", Value::Empty),
+            (3, "A3+1", Value::Empty)]
+        {
+            let mut cell = Cell::formula(Formula::new(formula));
+            cell.value = value;
+            sh.set_cell(CellRef::new(row, 0), cell);
+        }
+        sh.set_cell(CellRef::new(0, 1), Cell::formula(Formula::new("ISFORMULA(A1)")));
+        sh.set_cell(CellRef::new(1, 1), Cell::formula(Formula::new("FORMULATEXT(A1)")));
+        let doc = load_book(&wb);
+        for (row, expected) in [42.0, 84.0, 85.0, 86.0].into_iter().enumerate() {
+            let cell = doc.workbook.sheets[0].cells.get(CellRef::new(row as u32, 0)).unwrap();
+            assert_eq!(cell.value.as_f64(), Some(expected));
+            assert!(cell.formula.is_some());
+        }
+        assert_eq!(doc.workbook.sheets[0].value(CellRef::new(0, 1)), Value::Bool(true));
+        assert_eq!(doc.workbook.sheets[0].value(CellRef::new(1, 1)),
+            Value::text("=UNSUPPORTED_UDF()"));
+        let csv = ExcelDocument::load(Path::new("values.csv"), b"42,84\n").unwrap().0;
+        assert!(csv.extract_cached_text(0).raw.contains("84"));
+    }
+
+    #[test]
+    fn saved_legacy_and_dynamic_array_results_survive_missing_formula_calculation() {
+        use gridcraft_engine::model::{Cell, Formula};
+        for legacy in [true, false] {
+            let mut wb = Workbook::new();
+            let sh = Arc::make_mut(&mut wb.sheets[0]);
+            let range = RangeRef::new(CellRef::new(0, 0), CellRef::new(2, 0));
+            let mut formula = Formula::new("UNSUPPORTED_ARRAY_UDF()");
+            if legacy { formula.array = Some(range); }
+            let mut anchor = Cell::formula(formula);
+            anchor.value = Value::Number(42.0);
+            sh.set_cell(range.start, anchor);
+            sh.set_value(CellRef::new(1, 0), Value::Number(84.0));
+            sh.set_value(CellRef::new(2, 0), Value::Number(126.0));
+            sh.spill_ranges.insert(range.start, range);
+            sh.set_cell(CellRef::new(0, 1), Cell::formula(Formula::new("A2+1")));
+            if !legacy {
+                sh.set_cell(CellRef::new(1, 1), Cell::formula(Formula::new("SUM(A1#)")));
+            }
+            let doc = load_book(&wb);
+            let sh = &doc.workbook.sheets[0];
+            for (row, expected) in [42.0, 84.0, 126.0].into_iter().enumerate() {
+                assert_eq!(sh.value(CellRef::new(row as u32, 0)).as_f64(), Some(expected),
+                    "lost saved {} array result at row {row}", if legacy { "legacy" } else { "dynamic" });
+            }
+            assert_eq!(sh.value(CellRef::new(0, 1)).as_f64(), Some(85.0));
+            if !legacy {
+                assert_eq!(sh.spill_ranges.get(&range.start), Some(&range));
+                assert_eq!(sh.value(CellRef::new(1, 1)).as_f64(), Some(252.0));
+            }
+            let anchor = sh.cells.get(range.start).unwrap();
+            assert!(anchor.formula.is_some());
+            assert_eq!(anchor.formula.as_ref().unwrap().array.is_some(), legacy);
+            let text = doc.extract_cached_text(0).raw;
+            assert!(text.contains("126"));
+            assert!(!text.contains("#NAME?"));
+        }
+    }
+
+    #[test]
+    fn missing_dynamic_array_anchor_recalculates_without_stale_imported_followers() {
+        use gridcraft_engine::model::{Cell, Formula};
+        let mut wb = Workbook::new();
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        let range = RangeRef::new(CellRef::new(0, 0), CellRef::new(2, 0));
+        sh.set_cell(range.start, Cell::formula(Formula::new("SEQUENCE(3)")));
+        sh.spill_ranges.insert(range.start, range);
+        // These stale saved followers must be released when the anchor has no cache.
+        sh.set_value(CellRef::new(1, 0), Value::Number(84.0));
+        sh.set_value(CellRef::new(2, 0), Value::Number(126.0));
+        sh.set_value(CellRef::new(3, 0), Value::from("NeighborSentinel"));
+        let mut cached = Cell::formula(Formula::new("UNSUPPORTED_UDF()"));
+        cached.value = Value::Number(42.0);
+        sh.set_cell(CellRef::new(0, 1), cached);
+        sh.set_cell(CellRef::new(1, 1), Cell::formula(Formula::new("A3+B1")));
+        let doc = load_book(&wb);
+        let sh = &doc.workbook.sheets[0];
+        for (row, expected) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+            assert_eq!(sh.value(CellRef::new(row as u32, 0)).as_f64(), Some(expected));
+        }
+        assert_eq!(sh.value(CellRef::new(0, 1)).as_f64(), Some(42.0));
+        assert_eq!(sh.value(CellRef::new(1, 1)).as_f64(), Some(45.0));
+        assert_eq!(sh.value(CellRef::new(3, 0)), Value::from("NeighborSentinel"));
+        assert!(doc.extract_cached_text(0).raw.contains("NeighborSentinel"));
+    }
+
+    #[test]
+    fn tiny_grid_blank_fill_is_partitioned_not_expanded_and_stays_visible() {
+        use gridcraft_engine::model::{CfRule, CondFormat, Fill};
+        let mut wb = Workbook::new();
+        let area = RangeRef::new(CellRef::new(0, 0), CellRef::new(10_000, 99));
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        sh.default_row_height = 0.0001;
+        sh.default_col_width = 1.0;
+        sh.set_value(area.start, Value::Number(1.0));
+        sh.set_value(area.end, Value::Number(2.0));
+        let mut style = Style::default();
+        style.fill = Fill::solid(Color::rgb(20, 180, 40));
+        sh.cond_formats.push(CondFormat {
+            ranges: vec![area], rule: CfRule::Blanks { style: Box::new(style) },
+            priority: 1, stop_if_true: false,
+        });
+        let mut lay = layout_sheet(&wb, 0, &PrintOptions::default(), Some(area)).unwrap();
+        lay.scale = 1.0;
+        let sh = &wb.sheets[0];
+        let b = make_block(&wb, 0, sh, (0, 10_000), (0, 99), 0.0, 0.0, &lay);
+        let cells = block_cells(&wb, sh, area);
+        assert_eq!(cells.len(), 2);
+        let mut tiles = 0;
+        let mut painted = 0;
+        visit_blank_formats(&b, &cells, &[], &mut Some(CfCache::new()), |r, l| {
+            assert_eq!(l.fill, Some([20, 180, 40]));
+            tiles += 1;
+            painted += r.count();
+        });
+        assert!(tiles <= 9, "{tiles} tiles for a uniform blank fill");
+        assert_eq!(painted, area.count() - 2);
+        let mut pg = PageCanvas::new(100, 100, Affine::scale_non_uniform(1.0, 100.0));
+        draw_block(&mut pg, &b, true, &mut Some(CfCache::new()), &mut ImageCache::new());
+        let pixels = pg.finish();
+        assert_eq!(&pixels[(20 * 100 + 20) * 4..(20 * 100 + 20) * 4 + 3], &[20, 180, 40]);
+    }
+
+    #[test]
+    fn image_decoder_accepts_all_enabled_formats_and_enforces_pixel_budget() {
+        let img = image::RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 255]));
+        let mut cache = ImageCache::new();
+        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg,
+            image::ImageFormat::Bmp, image::ImageFormat::Gif, image::ImageFormat::WebP]
+        {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            let encoded = if format == image::ImageFormat::Jpeg {
+                image::DynamicImage::ImageRgb8(image::DynamicImage::ImageRgba8(img.clone()).to_rgb8())
+            } else {
+                image::DynamicImage::ImageRgba8(img.clone())
+            };
+            encoded.write_to(&mut bytes, format).unwrap();
+            let (_, w, h) = decode_cached_pixmap(bytes.get_ref(), &mut cache)
+                .unwrap_or_else(|| panic!("failed to decode {format:?}"));
+            assert_eq!((w, h), (4, 3));
+        }
+        let large = image::RgbImage::new(4_001, 4_000);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        large.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        // This exceeds the pixel budget, not either dimension limit.
+        assert!(decode_cached_pixmap(bytes.get_ref(), &mut cache).is_none());
+    }
+
+    #[test]
+    fn icon_sets_draw_thresholded_shapes_even_when_values_are_hidden() {
+        use gridcraft_engine::model::{CfRule, CfValueKind, CondFormat};
+        let render = |show_value| {
+            let mut wb = Workbook::new();
+            let sh = Arc::make_mut(&mut wb.sheets[0]);
+            sh.default_row_height = 24.0;
+            sh.default_col_width = 100.0;
+            for (row, value) in [0.0, 50.0, 100.0].into_iter().enumerate() {
+                sh.set_value(CellRef::new(row as u32, 0), Value::Number(value));
+            }
+            let area = RangeRef::new(CellRef::new(0, 0), CellRef::new(2, 0));
+            sh.cond_formats.push(CondFormat {
+                ranges: vec![area], rule: CfRule::IconSet {
+                    set: "3TrafficLights1".into(),
+                    thresholds: [0.0, 33.0, 67.0].map(CfValueKind::Number).to_vec(),
+                    reverse: false, show_value,
+                }, priority: 1, stop_if_true: false,
+            });
+            let mut lay = layout_sheet(&wb, 0, &PrintOptions::default(), Some(area)).unwrap();
+            lay.scale = 1.0;
+            let b = make_block(&wb, 0, &wb.sheets[0], (0, 2), (0, 0), 0.0, 0.0, &lay);
+            let mut pg = PageCanvas::new(80, 60, Affine::IDENTITY);
+            draw_block(&mut pg, &b, false, &mut Some(CfCache::new()), &mut ImageCache::new());
+            pg.finish()
+        };
+        let hidden = render(false);
+        let shown = render(true);
+        for (row, color) in [[209, 59, 47], [242, 184, 46], [46, 158, 79]].into_iter().enumerate() {
+            let offset = ((row * 18 + 9) * 80 + 7) * 4;
+            assert_eq!(&hidden[offset..offset + 3], &color);
+            assert_eq!(&shown[offset..offset + 3], &color);
+        }
+        let text_pixels = |pixels: &[u8]| (0..54).flat_map(|y| (20..75).map(move |x| (y * 80 + x) * 4))
+            .filter(|&offset| pixels[offset + 3] > 0).count();
+        assert_eq!(text_pixels(&hidden), 0);
+        assert!(text_pixels(&shown) > 0);
+    }
+
+    #[test]
+    fn every_standard_icon_variant_has_distinct_low_and_high_vector_output() {
+        for set in ["3Arrows", "3ArrowsGray", "3Flags", "3TrafficLights1", "3TrafficLights2",
+            "3Signs", "3Symbols", "3Symbols2", "4Arrows", "4ArrowsGray", "4RedToBlack",
+            "4Rating", "4TrafficLights", "5Arrows", "5ArrowsGray", "5Rating", "5Quarters",
+            "3Stars", "3Triangles", "5Boxes"]
+        {
+            let render = |index| {
+                let mut pg = PageCanvas::new(40, 40, Affine::IDENTITY);
+                draw_cf_icon(&mut pg, set, index, (4.0, 4.0, 32.0));
+                pg.finish()
+            };
+            let low = render(0);
+            let high = render(gridcraft_engine::cf::icon_count(set) - 1);
+            assert!(low.chunks_exact(4).any(|p| p[3] > 0), "{set} has no low icon");
+            assert!(high.chunks_exact(4).any(|p| p[3] > 0), "{set} has no high icon");
+            assert_ne!(low, high, "{set} loses its index semantics");
+        }
+    }
+
+    #[test]
+    fn overlapping_tiny_and_hidden_gridlines_form_bounded_visible_strips() {
+        let positions: Vec<_> = (0..100_001).map(|i| i as f32 * 0.0001).collect();
+        let mut runs = Vec::new();
+        visit_gridline_runs(&positions, 0.1, |start, end| runs.push((start, end)));
+        assert_eq!(runs, vec![(0.0, 10.0)]);
+        let mut runs = Vec::new();
+        visit_gridline_runs(&[0.0, 0.0, 0.05, 2.0, 2.02, 4.0], 0.1,
+            |start, end| runs.push((start, end)));
+        assert_eq!(runs, vec![(0.0, 0.05), (2.0, 2.02), (4.0, 4.0)]);
     }
 }

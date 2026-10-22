@@ -7,6 +7,10 @@ repository = "https://github.com/mrzv/officeterm"
 description = "A low-latency Office document viewer (PowerPoint, Word, Excel) for Kitty terminals"
 license = "MIT"
 
+[workspace]
+members = ["vendor/deckcraft-fonts", "vendor/gridcraft-calc", "vendor/gridcraft-xlsx", "vendor/wordcraft-doc"]
+resolver = "3"
+
 [[bin]]
 name = "oterm"
 path = "src/main.rs"
@@ -47,10 +51,18 @@ wordcraft-layout = { git = "https://github.com/storytold/wordcraft" }
 wordcraft-render = { git = "https://github.com/storytold/wordcraft" }
 
 [dev-dependencies]
+deckcraft-text = { git = "https://github.com/storytold/deckcraft" }
 tempfile = "3.27.0"
 
 [patch."https://github.com/storytold/wordcraft"]
 wordcraft-doc = { path = "vendor/wordcraft-doc" }
+
+[patch."https://github.com/storytold/deckcraft"]
+deckcraft-fonts = { path = "vendor/deckcraft-fonts" }
+
+[patch."https://github.com/storytold/gridcraft"]
+gridcraft-xlsx = { path = "vendor/gridcraft-xlsx" }
+gridcraft-calc = { path = "vendor/gridcraft-calc" }
 
 [profile.release]
 lto = "thin"

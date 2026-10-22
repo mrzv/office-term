@@ -1,0 +1,22 @@
+[package]
+name = "deckcraft-fonts"
+version = "0.9.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+repository = "https://github.com/storytold/deckcraft"
+description = "DeckCraft font database, metrics, outlines and shaping"
+
+[package.metadata.office-term]
+upstream-revision = "354087ecd56305842582e9e410cf24d595849789"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+kurbo = { version = "0.13", features = ["serde"] }
+skrifa = "0.47"
+harfrust = "0.13"
+unicode-bidi = "0.3"
+log = "0.4"
+epaint_default_fonts = "0.36"

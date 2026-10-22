@@ -289,6 +289,8 @@ struct App {
     missing_visible_page: Option<RenderKey>,
     pending_scale: Option<(RenderKey, FitMode, u16)>,
     canvas_viewport: Option<Viewport>,
+    #[cfg(test)]
+    test_viewport: Option<Viewport>,
     pending_vertical_scroll: i64,
     smooth_scroll_remaining: i64,
     smooth_scroll_tick: Instant,
@@ -744,6 +746,8 @@ impl App {
             missing_visible_page: None,
             pending_scale: None,
             canvas_viewport: None,
+            #[cfg(test)]
+            test_viewport: None,
             pending_vertical_scroll: 0,
             smooth_scroll_remaining: 0,
             smooth_scroll_tick: Instant::now(),
@@ -1316,7 +1320,7 @@ impl App {
     }
 
     fn ensure_link_index(&mut self) {
-        if self.link_mode {
+        if self.link_mode || self.link_picker.is_some() {
             self.start_link_index();
         }
     }
@@ -2059,7 +2063,7 @@ impl App {
             return self.redraw_link_picker(output);
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') if self.link_mode => {
+            KeyCode::Esc if self.link_mode => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
             KeyCode::Esc if filtering || has_filter => {
@@ -3599,6 +3603,10 @@ impl App {
     }
 
     fn viewport(&self) -> io::Result<Viewport> {
+        #[cfg(test)]
+        if let Some(viewport) = self.test_viewport {
+            return Ok(viewport);
+        }
         Viewport::detect(u16::from(self.session.tabs.len() > 1))
     }
 
@@ -6406,6 +6414,7 @@ mod tests {
             top: 1,
             status_row: 21,
         };
+        app.test_viewport = Some(viewport);
         app.tab_mut().scroll_y = 100;
         for page in 0..2 {
             let key = app.page_key(page, viewport);
@@ -6641,6 +6650,63 @@ mod tests {
         app.draw_continuous(&primary, viewport, &mut Vec::new())
             .unwrap();
         assert_eq!(app.tab().scroll_x, 0);
+    }
+
+    #[test]
+    fn retained_enter_picker_reindexes_after_reload_resets_links() {
+        let (mut app, _, _file) = continuous_app();
+        assert!(!app.link_mode);
+        app.link_picker = Some(LinkPickerState::new(0));
+        app.start_link_index();
+        let old_request = app.tab().link_index.request_id;
+
+        // Reload replaces the document's index while retaining its open picker.
+        app.tab_mut().link_index = super::LinkIndexState::new(2);
+        app.ensure_link_index();
+        let request_id = app.tab().link_index.request_id;
+        assert_ne!(request_id, old_request);
+        assert!(app.tab().link_index.indexing);
+        let document_id = app.tab().document_id;
+        app.receive_link_index_progress(
+            document_id,
+            super::LinkIndexUpdate {
+                request_id,
+                links: vec![DocumentLink {
+                    source_page: 0,
+                    ordinal: 0,
+                    source_top_ratio: 0.1,
+                    label: "Reloaded link".to_string(),
+                    source_context: None,
+                    reference_context: None,
+                    target: LinkTarget::Uri("https://example.com/reloaded".to_string()),
+                }],
+                scanned: 2,
+                total: 2,
+                complete: true,
+            },
+            &mut Vec::new(),
+        )
+        .expect("fresh links should update the retained picker");
+        assert_eq!(app.tab().link_index.links[0].label, "Reloaded link");
+        assert_eq!(app.link_picker.as_ref().unwrap().selection_key, Some((0, 0)));
+    }
+
+    #[test]
+    fn link_mode_picker_accepts_q_in_filter_text() {
+        let (mut app, _, _file) = continuous_app();
+        app.link_mode = true;
+        app.link_picker = Some(LinkPickerState::new(0));
+        for character in "/abcq".chars() {
+            app.handle_link_picker_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .expect("filter input should not close the picker");
+        }
+        let picker = app.link_picker.as_ref().expect("picker remains open");
+        assert!(app.link_mode);
+        assert!(picker.filtering);
+        assert_eq!(picker.filter, "abcq");
     }
 
     #[test]

@@ -17,6 +17,12 @@ Minimal terminal Office document viewer built on the ArtCraft collection (`deckc
 cargo run --release -- path/to/document.docx
 ```
 
+Run the application and vendored-library regression suites:
+
+```sh
+cargo test --locked --workspace --all-targets
+```
+
 Or launch `oterm` without a path to pick an Office document from the current directory tree:
 
 ```sh
@@ -48,6 +54,21 @@ oterm --session demo --screenshot page.png
 Relative screenshot paths resolve from the requesting command's working directory,
 not the viewer's. Existing destination files are never overwritten.
 
+## Rendering and document fidelity
+
+- Saved spreadsheet formula results are preserved, including results from custom
+  functions that the local calculation engine cannot evaluate.
+- Sparse worksheets retain populated regions beyond large empty gaps. Blank-cell
+  formatting is rendered without expanding entire worksheet ranges into memory.
+- Spreadsheet pictures support PNG, JPEG, GIF, WebP, and BMP. Conditional-format
+  icons remain visible when the rule hides the cell's numeric value.
+- Embedded PowerPoint and Word font subsets are isolated between documents.
+  Wrapped hyperlinks are clickable only on their linked text segments.
+- Fit-content includes Word freeform drawings and ink, and ignores PowerPoint
+  objects parked completely outside the slide.
+- An open link browser refreshes after document reload. While editing its filter,
+  `q` is ordinary query text; `Esc` still leaves the mode.
+
 ## Configuration and stored state
 
 Configuration lives at `$XDG_CONFIG_HOME/officeterm/config.toml`, or
@@ -60,9 +81,16 @@ non-UTF8 filenames. The previous newline-delimited history is ignored and replac
 when a document is next recorded.
 
 The vendored `wordcraft-doc` crate is pinned to upstream revision
-`ff3c7d8d25bd8271326f372cb90f2c8106ec4d92`. Its symbol-font lookup recognizes
-document-specific aliases so embedded font subsets stay isolated without changing
-Word symbol shaping or extracted text.
+`ff3c7d8d25bd8271326f372cb90f2c8106ec4d92`, with local fixes for embedded symbol
+fonts, numbering restarts, legacy-form XML text, equation breaks, locale-aware
+collation, and rotated connector rerouting. The vendored `deckcraft-fonts` crate
+is pinned to `354087ecd56305842582e9e410cf24d595849789` and adds document-local
+font-family registration without changing embedded font bytes.
+The `gridcraft-xlsx` importer and `gridcraft-calc` engine are pinned to
+`8ae67c5534f3d7f145423a57206cf5fd08fe9221`. The importer preserves saved array
+and spill results, releasing their cached followers only when an anchor needs
+calculation. The viewer calculates only missing results without hiding formula
+metadata or recalculating saved results.
 
 ## Controls
 

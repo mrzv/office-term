@@ -1,0 +1,22 @@
+[package]
+name = "gridcraft-calc"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "GridCraft calculation engine: dependency graph, recalculation, evaluator, dynamic arrays"
+
+[package.metadata.upstream]
+repository = "https://github.com/storytold/gridcraft"
+revision = "8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+
+[dependencies]
+gridcraft-core = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-formula = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-functions = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-numfmt = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft" }
+log = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -211,7 +211,10 @@ pub fn reroute_group(children: &mut [GroupChild]) -> bool {
         if !kind.is_connector() || (extra.start.is_none() && extra.end.is_none()) {
             continue;
         }
-        let (s0, e0) = ends(c.x, c.y, *w, *h, float.flip_h, float.flip_v);
+        let spin = float.spin();
+        let (s0, e0) = ((c.x, c.y), (c.x + *w, c.y + *h));
+        let (cx, cy) = (c.x + *w / 2.0, c.y + *h / 2.0);
+        let (s0, e0) = (spin.apply(cx, cy, s0.0, s0.1), spin.apply(cx, cy, e0.0, e0.1));
         let (s, e) = (find(extra.start).unwrap_or(s0), find(extra.end).unwrap_or(e0));
         let f = route(s, e);
         let same = (f.x - c.x).abs() < 0.01 && (f.y - c.y).abs() < 0.01 && (f.w - *w).abs() < 0.01 && (f.h - *h).abs() < 0.01;
@@ -248,6 +251,32 @@ mod tests {
             freeform: None,
             effects: Default::default(),
             extra,
+        }
+    }
+
+    #[test]
+    fn rerouting_keeps_rotated_free_or_unresolved_ends() {
+        for free_end in [None, Some(ConnEnd { id: 404, site: 0 }), Some(ConnEnd { id: 7, site: 99 })] {
+            for flip_h in [false, true] {
+                let link = ShapeExtra { start: Some(ConnEnd { id: 7, site: 3 }), end: free_end, ..Default::default() };
+                let mut obj = shape(ShapeKind::StraightConnector, 10.0, 10.0, link);
+                let InlineObject::Shape { float, .. } = &mut obj else { panic!() };
+                float.rot = 90.0;
+                float.flip_h = flip_h;
+                let expected = if flip_h { (0.0, 0.0) } else { (0.0, 10.0) };
+                let mut kids = vec![
+                    GroupChild { x: 20.0, y: 20.0, obj: shape(ShapeKind::Rectangle, 10.0, 10.0, ShapeExtra { id: 7, ..Default::default() }) },
+                    GroupChild { x: 0.0, y: 0.0, obj },
+                ];
+                assert!(reroute_group(&mut kids));
+                let c = &kids[1];
+                let InlineObject::Shape { w, h, float, .. } = &c.obj else { panic!() };
+                let (start, end) = ends(c.x, c.y, *w, *h, float.flip_h, float.flip_v);
+                assert!((start.0 - 30.0).abs() < 0.001 && (start.1 - 25.0).abs() < 0.001);
+                assert!((end.0 - expected.0).abs() < 0.001 && (end.1 - expected.1).abs() < 0.001);
+                assert_eq!(float.rot, 0.0);
+                assert!(!reroute_group(&mut kids));
+            }
         }
     }
 

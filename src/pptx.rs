@@ -732,41 +732,170 @@ fn load_presentation_from_bytes(path: &Path, bytes: &[u8]) -> Result<Presentatio
     let mut presentation = deckcraft_pptx::import(bytes)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     deckcraft_format::repair(&mut presentation);
-    install_embedded_fonts(&presentation);
+    install_embedded_fonts(&mut presentation);
     if presentation.slides.is_empty() {
         return Err(format!("{} has no slides", path.display()));
     }
     Ok(presentation)
 }
 
-fn install_embedded_fonts(presentation: &Presentation) {
-    static INSTALLED_FONTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(u64, usize)>>,
-    > = std::sync::OnceLock::new();
-
-    if presentation.embedded_fonts.is_empty() {
-        return;
-    }
-    let installed =
-        INSTALLED_FONTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let font_db = FontDb::global();
-    for embedded in &presentation.embedded_fonts {
-        for media_id in embedded.faces().into_iter().flatten() {
-            if let Some(item) = presentation.media(media_id)
+fn install_embedded_fonts(presentation: &mut Presentation) {
+    let mut files = Vec::new();
+    for font in &presentation.embedded_fonts {
+        for id in font.faces().into_iter().flatten() {
+            if let Some(item) = presentation.media(id)
                 && let Some(sfnt) = deckcraft_fonts::embedded_sfnt(&item.data)
             {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(&sfnt, &mut hasher);
-                let hash = std::hash::Hasher::finish(&hasher);
-                let is_new = installed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert((hash, sfnt.len()));
-                if is_new {
-                    font_db.add_font(sfnt.to_owned());
-                }
+                files.push((font.typeface.clone(), sfnt.to_vec()));
             }
         }
+    }
+    if !files.is_empty() {
+        remap_presentation_fonts(presentation, &register_presentation_fonts(files));
+    }
+}
+
+type FontAliases = HashMap<String, String>;
+
+fn register_presentation_fonts(files: Vec<(String, Vec<u8>)>) -> FontAliases {
+    // Reopening shares registrations only when every face's actual subset bytes match.
+    type Registrations = HashMap<Vec<(String, Vec<u8>)>, FontAliases>;
+    static FONTS: std::sync::LazyLock<std::sync::Mutex<Registrations>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut fonts = FONTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(aliases) = fonts.get(&files) {
+        return aliases.clone();
+    }
+    let mut aliases = FontAliases::new();
+    for (name, _) in &files {
+        let name = name.trim().to_lowercase();
+        let next = aliases.len();
+        aliases.entry(name.clone()).or_insert_with(|| {
+            // DeckCraft dispatches symbol glyphs/bullets by family name. Keep both its
+            // prefix-based PUA dispatch and its broader substring-based bullet mapping.
+            // Its exact "Symbol" branch uses the same mapping as generic Wingdings.
+            let symbol = if name == "symbol" {
+                "wingdings"
+            } else if name.contains("wingdings")
+                || name.starts_with("webdings")
+                || name.starts_with("marlett")
+                || name.contains("symbol")
+            {
+                &name
+            } else {
+                ""
+            };
+            let separator = if symbol.is_empty() { "" } else { "-" };
+            format!("{symbol}{separator}office-term-pptx-{}-font-{next}", fonts.len())
+        });
+    }
+    // Register only private aliases: the original family must not leak into another deck.
+    FontDb::global().add_document_fonts(
+        files
+            .iter()
+            .map(|(name, bytes)| {
+                (
+                    bytes.clone(),
+                    name.clone(),
+                    aliases[&name.trim().to_lowercase()].clone(),
+                )
+            })
+            .collect(),
+    );
+    fonts.insert(files, aliases.clone());
+    aliases
+}
+
+fn remap_presentation_fonts(presentation: &mut Presentation, aliases: &FontAliases) {
+    fn font(name: &mut String, aliases: &FontAliases) {
+        if let Some(alias) = aliases.get(&name.trim().to_lowercase()) {
+            name.clone_from(alias);
+        }
+    }
+    fn optional_font(name: &mut Option<String>, aliases: &FontAliases) {
+        if let Some(name) = name {
+            font(name, aliases);
+        }
+    }
+    fn run(props: &mut deckcraft_model::text::RunProps, aliases: &FontAliases) {
+        for name in [
+            &mut props.font,
+            &mut props.font_ea,
+            &mut props.font_cs,
+            &mut props.font_sym,
+        ] {
+            optional_font(name, aliases);
+        }
+    }
+    fn list(style: &mut deckcraft_model::text::ListStyle, aliases: &FontAliases) {
+        for level in style.levels.iter_mut().flatten() {
+            optional_font(&mut level.para.bullet_font, aliases);
+            run(&mut level.run, aliases);
+        }
+    }
+    fn text(body: &mut deckcraft_model::TextBody, aliases: &FontAliases) {
+        list(&mut body.list_style, aliases);
+        for para in &mut body.paragraphs {
+            optional_font(&mut para.props.bullet_font, aliases);
+            run(&mut para.def_props, aliases);
+            run(&mut para.end_props, aliases);
+            for item in &mut para.runs {
+                run(&mut item.props, aliases);
+            }
+        }
+    }
+    fn shapes(items: &mut [Shape], aliases: &FontAliases) {
+        for shape in items {
+            if let Some(body) = &mut shape.text {
+                text(body, aliases);
+            }
+            match &mut shape.kind {
+                ShapeKind::Group { children, .. } => shapes(children, aliases),
+                ShapeKind::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            text(&mut cell.text, aliases);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn master(item: &mut deckcraft_model::Master, aliases: &FontAliases) {
+        for set in [&mut item.theme.fonts.major, &mut item.theme.fonts.minor] {
+            for name in [&mut set.latin, &mut set.ea, &mut set.cs] {
+                font(name, aliases);
+            }
+            for script in &mut set.scripts {
+                font(&mut script.typeface, aliases);
+            }
+        }
+        for style in [&mut item.title_style, &mut item.body_style, &mut item.other_style] {
+            list(style, aliases);
+        }
+        shapes(&mut item.shapes, aliases);
+        for layout in &mut item.layouts {
+            shapes(&mut layout.shapes, aliases);
+        }
+    }
+    list(&mut presentation.default_text_style, aliases);
+    for slide in &mut presentation.slides {
+        let slide = Arc::make_mut(slide);
+        shapes(&mut slide.shapes, aliases);
+        text(&mut slide.notes, aliases);
+    }
+    for item in &mut presentation.masters {
+        master(Arc::make_mut(item), aliases);
+    }
+    for item in [&mut presentation.notes_master, &mut presentation.handout_master]
+        .into_iter()
+        .flatten()
+    {
+        master(Arc::make_mut(item), aliases);
+    }
+    for embedded in &mut presentation.embedded_fonts {
+        font(&mut embedded.typeface, aliases);
     }
 }
 
@@ -1362,6 +1491,9 @@ pub(crate) fn include_rect_bounds(
     let y0 = (r.y0 as f32).clamp(0.0, slide_h);
     let x1 = (r.x1 as f32).clamp(0.0, slide_w);
     let y1 = (r.y1 as f32).clamp(0.0, slide_h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
     // Ignore full-bleed background shapes when computing content bounds.
     if x0 <= 1.0 && y0 <= 1.0 && x1 >= slide_w - 1.0 && y1 >= slide_h - 1.0 {
         return;
@@ -1676,9 +1808,6 @@ fn extract_slide_links(
                 if let Some(hlink) = &run.props.link
                     && let Some(target) =
                         resolve_hyperlink(presentation, slide_index, total_slides, hlink)
-                    && let Some(bbox) =
-                        placed_text_span_bbox(pt, char_offset, char_offset + run_len)
-                    && let Some(rect) = bbox_to_page_link_rect(bbox, width, height, scale)
                 {
                     let label = normalize_context_text(&run.text);
                     let label = if label.is_empty() {
@@ -1686,10 +1815,14 @@ fn extract_slide_links(
                     } else {
                         label
                     };
-                    links.push(PageLink {
-                        rect,
-                        label,
-                        target,
+                    for_each_text_span_rect(pt, char_offset, char_offset + run_len, |bbox| {
+                        if let Some(rect) = bbox_to_page_link_rect(bbox, width, height, scale) {
+                            links.push(PageLink {
+                                rect,
+                                label: label.clone(),
+                                target: target.clone(),
+                            });
+                        }
                     });
                 }
                 char_offset += run_len;
@@ -1756,12 +1889,12 @@ pub(crate) fn default_link_label(target: &LinkTarget) -> String {
     }
 }
 
-fn placed_text_span_bbox(
+fn for_each_text_span_rect(
     pt: &deckcraft_render::PlacedText,
     char_start: usize,
     char_end: usize,
-) -> Option<KurboRect> {
-    let mut union: Option<KurboRect> = None;
+    mut visit: impl FnMut(KurboRect),
+) {
     let mut paragraph_start = 0;
     for (para_index, paragraph) in pt.body.paragraphs.iter().enumerate() {
         let paragraph_end = paragraph_start + paragraph.char_len();
@@ -1776,17 +1909,12 @@ fn placed_text_span_bbox(
             {
                 if let Some((x0, x1)) = line.span(start - paragraph_start, end - paragraph_start) {
                     let local = KurboRect::new(x0, line.top, x1, line.bottom);
-                    let rect = transform_rect_bbox(&pt.transform, local);
-                    union = Some(match union {
-                        Some(prev) => prev.union(rect),
-                        None => rect,
-                    });
+                    visit(transform_rect_bbox(&pt.transform, local));
                 }
             }
         }
         paragraph_start = paragraph_end + 1;
     }
-    union
 }
 
 pub(crate) fn transform_rect_bbox(affine: &kurbo::Affine, rect: KurboRect) -> KurboRect {
@@ -2362,6 +2490,376 @@ mod tests {
         deckcraft_pptx::export(&pres).expect("export pptx")
     }
 
+    fn font_with_advance(advance: u16) -> Vec<u8> {
+        // Keep real outlines and identical family/style names; only the widths differ.
+        let mut bytes = deckcraft_fonts::bundled().last().unwrap().to_vec();
+        let count = usize::from(u16::from_be_bytes(bytes[4..6].try_into().unwrap()));
+        let table = |tag: &[u8]| {
+            let record = (0..count)
+                .map(|i| 12 + 16 * i)
+                .find(|&i| &bytes[i..i + 4] == tag)
+                .unwrap();
+            u32::from_be_bytes(bytes[record + 8..record + 12].try_into().unwrap()) as usize
+        };
+        let hhea = table(b"hhea");
+        let hmtx = table(b"hmtx");
+        let metrics = usize::from(u16::from_be_bytes(
+            bytes[hhea + 34..hhea + 36].try_into().unwrap(),
+        ));
+        for i in 0..metrics {
+            bytes[hmtx + 4 * i..hmtx + 4 * i + 2].copy_from_slice(&advance.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn embedded_font_deck(bytes: &[u8]) -> Vec<u8> {
+        let mut pres = Presentation::default();
+        pres.slides.clear();
+        let media = pres
+            .add_media("subset.ttf", "application/x-font-ttf", bytes.to_vec())
+            .unwrap();
+        pres.embedded_fonts.push(deckcraft_model::EmbeddedFont {
+            typeface: "Ubuntu".into(),
+            regular: Some(media),
+            ..Default::default()
+        });
+        let master = Arc::make_mut(&mut pres.masters[0]);
+        master.theme.fonts.minor.latin = "Ubuntu".into();
+        pres.slides.push(Arc::new(Slide {
+            id: SlideId(1),
+            show_master_shapes: false,
+            shapes: vec![Shape {
+                id: ShapeId(2),
+                xfrm: Some(Xfrm::new(40.0, 40.0, 800.0, 200.0)),
+                text: Some(TextBody {
+                    paragraphs: vec![
+                        Paragraph::new("AAAA"),
+                        Paragraph {
+                            runs: vec![Run::with("BBBB", deckcraft_model::text::RunProps {
+                                font: Some("Ubuntu".into()),
+                                ..Default::default()
+                            })],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        deckcraft_pptx::export(&pres).unwrap()
+    }
+
+    #[test]
+    fn embedded_font_subsets_are_isolated_in_both_open_orders_and_on_reload() {
+        let a = font_with_advance(400);
+        let b = font_with_advance(1600);
+        let original = FontDb::global().face("Ubuntu", "Regular");
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            let first_bytes = embedded_font_deck(first);
+            let second_bytes = embedded_font_deck(second);
+            let one = load_presentation_from_bytes(Path::new("one.pptx"), &first_bytes).unwrap();
+            let placed_one = place_slide(&one, 0);
+            let face_one = &placed_one.texts[0].layout.runs[0].face;
+            assert!(placed_one.texts[0].layout.runs.len() >= 2);
+            for run in &placed_one.texts[0].layout.runs {
+                assert_eq!(run.face.data(), first.as_slice());
+            }
+            let two = load_presentation_from_bytes(Path::new("two.pptx"), &second_bytes).unwrap();
+            let placed_two = place_slide(&two, 0);
+            let face_two = &placed_two.texts[0].layout.runs[0].face;
+            for run in &placed_two.texts[0].layout.runs {
+                assert_eq!(run.face.data(), second.as_slice());
+            }
+            assert_ne!(face_one.family, face_two.family);
+            assert_eq!(place_slide(&one, 0).texts[0].layout.runs[0].face.data(), first);
+            let reopened = load_presentation_from_bytes(Path::new("one.pptx"), &first_bytes).unwrap();
+            let reopened = place_slide(&reopened, 0);
+            assert_eq!(reopened.texts[0].layout.runs[0].face.id(), face_one.id());
+            assert_eq!(FontDb::global().face("Ubuntu", "Regular").id(), original.id());
+        }
+    }
+
+    fn symbol_font_fixture(include_pua: bool) -> Vec<u8> {
+        // Real Ubuntu outlines with a deterministic symbol cmap. Different glyphs for PUA
+        // codes and look-alikes detect accidentally falling back instead of using the subset.
+        let db = FontDb::with_font_dirs(Vec::new());
+        let face = db.face("Ubuntu", "Regular");
+        let mut mappings: Vec<(u32, u32)> = (32..127)
+            .map(|c| (c, face.glyph_for(char::from_u32(c).unwrap())))
+            .collect();
+        mappings.extend("▪➢✓❖❑■●◆•–►◄▲▼➔▶✕◀★○".chars().map(|c| {
+            (c as u32, face.glyph_for('A'))
+        }));
+        if include_pua {
+            mappings.extend((0xF000..=0xF0FF).map(|c| (c, face.glyph_for('B'))));
+        }
+        mappings.sort_unstable_by_key(|&(c, _)| c);
+        mappings.dedup_by_key(|entry| entry.0);
+        let mut cmap = vec![0, 0, 0, 1, 0, 3, 0, 10, 0, 0, 0, 12, 0, 12, 0, 0];
+        cmap.extend_from_slice(&(16 + 12 * mappings.len() as u32).to_be_bytes());
+        cmap.extend_from_slice(&0u32.to_be_bytes());
+        cmap.extend_from_slice(&(mappings.len() as u32).to_be_bytes());
+        for (c, glyph) in mappings {
+            cmap.extend_from_slice(&c.to_be_bytes());
+            cmap.extend_from_slice(&c.to_be_bytes());
+            cmap.extend_from_slice(&glyph.to_be_bytes());
+        }
+        let mut bytes = font_with_advance(600);
+        let count = usize::from(u16::from_be_bytes(bytes[4..6].try_into().unwrap()));
+        let record = (0..count)
+            .map(|i| 12 + 16 * i)
+            .find(|&i| &bytes[i..i + 4] == b"cmap")
+            .unwrap();
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let offset = bytes.len() as u32;
+        bytes[record + 8..record + 12].copy_from_slice(&offset.to_be_bytes());
+        bytes[record + 12..record + 16].copy_from_slice(&(cmap.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&cmap);
+        bytes
+    }
+
+    #[test]
+    fn embedded_symbol_aliases_preserve_bullets_and_symbol_runs() {
+        use deckcraft_model::text::{Bullet, LevelStyle, RunProps};
+        for include_pua in [false, true] {
+            let bytes = symbol_font_fixture(include_pua);
+            for (family, code) in [
+                ("Symbol", 'n'),
+                ("Wingdings", 'n'),
+                ("Wingdings 2", '\u{97}'),
+                ("Wingdings 3", '}'),
+                ("Webdings", 'n'),
+                ("Marlett", 'n'),
+                ("Segoe UI Symbol", 'n'),
+                ("Office Wingdings Alternate", 'n'),
+            ] {
+                let baseline = FontDb::with_font_dirs(Vec::new());
+                baseline.add_document_fonts(vec![(bytes.clone(), "Ubuntu".into(), family.into())]);
+                let baseline_face = baseline.face(family, "Regular");
+                let baseline_symbol = deckcraft_text::symbol_char(&baseline_face, family, code);
+                let expected_char = baseline_symbol.unwrap_or_else(|| {
+                    deckcraft_text::map_symbol_bullet(&code.to_string(), Some(family))
+                        .chars().next().unwrap()
+                });
+                let pua_char = char::from_u32(0xF000 | code as u32).unwrap();
+                let expected_glyph = baseline_face.glyph_for(expected_char);
+                assert_ne!(expected_glyph, 0, "{family}");
+                if include_pua && baseline_symbol.is_some() {
+                    assert_eq!(expected_char, pua_char);
+                }
+                let mut pres = Presentation::default();
+                let media = pres.add_media("symbols.ttf", "application/x-font-ttf", bytes.clone()).unwrap();
+                pres.embedded_fonts.push(deckcraft_model::EmbeddedFont {
+                    typeface: family.into(),
+                    regular: Some(media),
+                    ..Default::default()
+                });
+                let marker = Bullet::Char { char: code.to_string() };
+                let mut inherited = Paragraph::new("A");
+                inherited.props.bullet = Some(marker.clone());
+                let mut explicit = Paragraph::new("A");
+                explicit.props.bullet = Some(marker.clone());
+                explicit.props.bullet_font = Some(family.into());
+                let mut listed = Paragraph::new("A");
+                listed.level = 1;
+                let mut body = TextBody {
+                    paragraphs: vec![inherited, explicit, listed],
+                    ..Default::default()
+                };
+                // Font-only inheritance and a complete list-level bullet both survive remapping.
+                pres.default_text_style.set(0, LevelStyle {
+                    para: deckcraft_model::text::ParaProps {
+                        bullet_font: Some(family.into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                body.list_style.set(1, LevelStyle {
+                    para: deckcraft_model::text::ParaProps {
+                        bullet: Some(marker),
+                        bullet_font: Some(family.into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                if include_pua {
+                    body.paragraphs.push(Paragraph {
+                        runs: vec![Run::with(pua_char.to_string(), RunProps {
+                            font_sym: Some(family.into()),
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    });
+                }
+                let slide = Arc::make_mut(&mut pres.slides[0]);
+                slide.show_master_shapes = false;
+                slide.shapes = vec![Shape {
+                    id: ShapeId(2),
+                    xfrm: Some(Xfrm::new(40.0, 40.0, 800.0, 400.0)),
+                    text: Some(body),
+                    ..Default::default()
+                }];
+                let pres = load_presentation_from_bytes(
+                    Path::new("symbols.pptx"), &deckcraft_pptx::export(&pres).unwrap(),
+                ).unwrap();
+                let placed = place_slide(&pres, 0);
+                let runs = &placed.texts[0].layout.runs;
+                let bullets: Vec<_> = runs.iter().filter(|r| r.cells.is_empty()).collect();
+                assert_eq!(bullets.len(), 3, "{family}");
+                for bullet in bullets {
+                    assert_eq!(bullet.face.data(), bytes, "{family}");
+                    assert_eq!(bullet.glyphs[0].0, expected_glyph, "{family}");
+                    assert_eq!(
+                        deckcraft_text::symbol_char(&bullet.face, &bullet.face.family, code),
+                        baseline_symbol,
+                        "{family}",
+                    );
+                }
+                if include_pua {
+                    let symbol = runs.iter().find(|r| r.para == 3 && !r.cells.is_empty()).unwrap();
+                    assert_eq!(symbol.face.data(), bytes, "{family}");
+                    assert_eq!(symbol.glyphs[0].0, baseline_face.glyph_for(pua_char), "{family}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fully_offslide_rectangles_do_not_extend_visible_content_bounds() {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for rect in [
+            KurboRect::new(-40.0, 20.0, -10.0, 80.0),
+            KurboRect::new(110.0, 20.0, 140.0, 80.0),
+            KurboRect::new(20.0, -40.0, 80.0, 0.0),
+            KurboRect::new(20.0, 100.0, 80.0, 140.0),
+        ] {
+            include_rect_bounds(
+                rect, &mut min_x, &mut min_y, &mut max_x, &mut max_y, 100.0, 100.0,
+            );
+        }
+        assert_eq!([min_x, min_y], [f32::INFINITY; 2]);
+        assert_eq!([max_x, max_y], [f32::NEG_INFINITY; 2]);
+        for rect in [
+            KurboRect::new(40.0, 40.0, 60.0, 60.0),
+            KurboRect::new(-20.0, 45.0, 10.0, 55.0),
+        ] {
+            include_rect_bounds(
+                rect, &mut min_x, &mut min_y, &mut max_x, &mut max_y, 100.0, 100.0,
+            );
+        }
+        assert_eq!([min_x, min_y, max_x, max_y], [0.0, 40.0, 60.0, 60.0]);
+    }
+
+    #[test]
+    fn wrapped_text_links_keep_separate_transformed_line_hit_regions() {
+        use deckcraft_model::text::{AutoFit, BodyProps, RunProps};
+        let prefix = "Prefix ";
+        let linked_text = "one two three four five six seven eight nine ten";
+        for action in [
+            Action::Url { url: " https://example.com ".into() },
+            Action::NextSlide,
+        ] {
+            for rotated in [false, true] {
+                let mut pres = Presentation::default();
+                pres.slides.clear();
+                let linked = Hyperlink {
+                    action: action.clone(),
+                    tooltip: String::new(),
+                    highlight_click: false,
+                    sound: None,
+                    stop_sound: false,
+                    zoom_return: None,
+                };
+                let child = Shape {
+                    id: ShapeId(2),
+                    xfrm: Some(Xfrm::new(10.0, 15.0, 160.0, 250.0)),
+                    text: Some(TextBody {
+                        body: BodyProps {
+                            wrap: Some(true),
+                            autofit: Some(AutoFit::None),
+                            ..Default::default()
+                        },
+                        paragraphs: vec![Paragraph {
+                            def_props: RunProps {
+                                font: Some("Ubuntu".into()),
+                                size: Some(20.0),
+                                ..Default::default()
+                            },
+                            runs: vec![
+                                Run::new(prefix),
+                                Run::with(linked_text, RunProps {
+                                    link: Some(linked),
+                                    ..Default::default()
+                                }),
+                            ],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut group_xfrm = Xfrm::new(200.0, 100.0, 240.0, 375.0);
+                if rotated {
+                    group_xfrm.rot = 90.0;
+                }
+                pres.slides.push(Arc::new(Slide {
+                    id: SlideId(1),
+                    show_master_shapes: false,
+                    shapes: vec![Shape {
+                        id: ShapeId(3),
+                        xfrm: Some(group_xfrm),
+                        kind: ShapeKind::Group {
+                            child: Xfrm::new(0.0, 0.0, 160.0, 250.0),
+                            children: vec![child],
+                        },
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }));
+                pres.slides.push(Arc::new(Slide { id: SlideId(4), ..Default::default() }));
+                let placed = place_slide(&pres, 0);
+                let pt = &placed.texts[0];
+                let links = extract_slide_links(&pres, 0, &placed, 1000, 1000, 1.0);
+                assert!(links.len() > 1, "the hyperlink must wrap");
+                let prefix_len = prefix.chars().count();
+                let first_line = &pt.layout.lines[0];
+                let (x0, x1) = first_line.span(0, prefix_len - 1).unwrap();
+                let prefix_point = pt.transform
+                    * KurboPoint::new((x0 + x1) * 0.5, (first_line.top + first_line.bottom) * 0.5);
+                for link in &links {
+                    assert_eq!(link.label, linked_text);
+                    let target = match &action {
+                        Action::Url { .. } => LinkTarget::Uri("https://example.com".into()),
+                        _ => LinkTarget::Internal { page: 1, top_ratio: None, left_ratio: None },
+                    };
+                    assert_eq!(link.target, target);
+                    assert!(
+                        prefix_point.x < f64::from(link.rect.left)
+                            || prefix_point.x >= f64::from(link.rect.right)
+                            || prefix_point.y < f64::from(link.rect.top)
+                            || prefix_point.y >= f64::from(link.rect.bottom),
+                        "the unlinked prefix must not be clickable: {link:?}",
+                    );
+                }
+                let expected: Vec<_> = pt.layout.lines.iter().filter_map(|line| {
+                    let (x0, x1) = line.span(prefix_len, prefix_len + linked_text.chars().count())?;
+                    bbox_to_page_link_rect(
+                        transform_rect_bbox(&pt.transform, KurboRect::new(x0, line.top, x1, line.bottom)),
+                        1000, 1000, 1.0,
+                    )
+                }).collect();
+                assert_eq!(links.iter().map(|link| link.rect).collect::<Vec<_>>(), expected);
+            }
+        }
+    }
+
     #[test]
     fn opens_renders_and_searches_pptx_slides() {
         let dir = tempfile::tempdir().unwrap();
@@ -2755,11 +3253,14 @@ mod tests {
         let target_start = prefix.chars().count() + 1;
         let target_bbox = expected(2, target_start, target_start + 6);
         let body_target_start = 5 + 2 + target_start;
-        assert_eq!(placed_text_span_bbox(pt, 0, 5), Some(first_bbox));
-        assert_eq!(
-            placed_text_span_bbox(pt, body_target_start, body_target_start + 6),
-            Some(target_bbox)
-        );
+        let mut first_rects = Vec::new();
+        for_each_text_span_rect(pt, 0, 5, |rect| first_rects.push(rect));
+        assert_eq!(first_rects, vec![first_bbox]);
+        let mut target_rects = Vec::new();
+        for_each_text_span_rect(pt, body_target_start, body_target_start + 6, |rect| {
+            target_rects.push(rect);
+        });
+        assert_eq!(target_rects, vec![target_bbox]);
         assert!(first_bbox.y1 < target_bbox.y0);
         let links = extract_slide_links(&pres, 0, &placed, 1000, 1000, 1.0);
         assert_eq!(links.len(), 2);
