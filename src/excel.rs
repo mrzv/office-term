@@ -1,4 +1,6 @@
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,6 +32,8 @@ const PAD_PX: f32 = 2.0;
 const DENSE_BLOCK: u64 = 4_000;
 
 type Rgb = [u8; 3];
+type CachedPixmap = (Arc<Pixmap>, u32, u32);
+type ImageCache = HashMap<(u64, usize), Option<CachedPixmap>>;
 
 fn layout_k(lay: &SheetLayout) -> f32 {
     PX_TO_PT * lay.scale
@@ -60,6 +64,7 @@ pub(crate) struct ExcelDocument {
     layouts: Vec<SheetLayout>,
     pages: Vec<ExcelPageSpec>,
     meta_cache: Vec<OnceCell<ExcelPageMeta>>,
+    image_cache: RefCell<ImageCache>,
     file_name: String,
     file_path: String,
 }
@@ -185,6 +190,7 @@ impl ExcelDocument {
                 layouts,
                 pages,
                 meta_cache,
+                image_cache: RefCell::new(HashMap::new()),
                 file_name,
                 file_path,
             },
@@ -327,13 +333,14 @@ impl ExcelDocument {
                 0.0
             };
 
+        let mut image_cache = self.image_cache.borrow_mut();
         let mut y = oy + lay.heading_h * k;
         let mut body: Option<Block> = None;
         for (rsi, rs) in rsegs.iter().enumerate() {
             let mut x = ox + lay.heading_w * k;
             for (csi, cs) in csegs.iter().enumerate() {
                 let b = make_block(&self.workbook, lay.sheet, sh, *rs, *cs, x, y, lay);
-                draw_block(&mut pg, &b, lay.settings.gridlines, &mut cf);
+                draw_block(&mut pg, &b, lay.settings.gridlines, &mut cf, &mut image_cache);
                 if lay.settings.headings {
                     draw_headings(
                         &mut pg,
@@ -352,7 +359,7 @@ impl ExcelDocument {
             y += seg_size(sh, *rs, true) * k;
         }
         if let Some(b) = &body {
-            draw_objects(&mut pg, &self.workbook, lay.sheet, sh, b);
+            draw_objects(&mut pg, &self.workbook, lay.sheet, sh, b, &mut image_cache);
         }
         if lay.settings.headings {
             let fill = [0xF2, 0xF2, 0xF2];
@@ -463,7 +470,7 @@ impl ExcelDocument {
 
         let mut object_texts: Vec<(&str, KurboRect)> = Vec::new();
         let mut y = oy + lay.heading_h * k;
-        let mut body_block: Option<Block> = None;
+        let mut blocks: Vec<(usize, usize, Block)> = Vec::new();
         for (rsi, rs) in rsegs.iter().enumerate() {
             let mut x = ox + lay.heading_w * k;
             for (csi, cs) in csegs.iter().enumerate() {
@@ -614,41 +621,69 @@ impl ExcelDocument {
                             }
                         }
                     }
-                    body_block = Some(b);
                 }
 
+                blocks.push((rsi, csi, b));
                 x += seg_size(sh, *cs, false) * k;
             }
             y += seg_size(sh, *rs, true) * k;
         }
 
-        let band_range = RangeRef::new(
-            CellRef::new(spec.row_band.0, spec.col_band.0),
-            CellRef::new(spec.row_band.1, spec.col_band.1),
-        );
-        let cells: Vec<CellRef> = if band_range.count() <= DENSE_BLOCK {
-            band_range.iter().collect()
-        } else {
-            let mut set: Vec<CellRef> = sh.cells.iter_range(band_range).map(|(c, _)| c).collect();
-            set.extend(
-                sh.spill
-                    .range(band_range.start..=band_range.end)
-                    .map(|(c, _)| *c)
-                    .filter(|c| band_range.contains(*c)),
-            );
-            set.sort_unstable();
-            set.dedup();
-            set
-        };
-        let mut current_row: Option<u32> = None;
-        for cell in cells {
-            let text = gridcraft_engine::display::cell_text(&self.workbook, sh, cell);
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
+        let mut placed_cells: Vec<(usize, u32, usize, u32, String, Option<KurboRect>)> =
+            Vec::new();
+        for (rsi, csi, b) in &blocks {
+            let block_range = b.range();
+            let cells: Vec<CellRef> = if block_range.count() <= DENSE_BLOCK {
+                block_range.iter().collect()
+            } else {
+                let mut set: Vec<CellRef> =
+                    sh.cells.iter_range(block_range).map(|(c, _)| c).collect();
+                set.extend(
+                    sh.spill
+                        .range(block_range.start..=block_range.end)
+                        .map(|(c, _)| *c)
+                        .filter(|c| block_range.contains(*c)),
+                );
+                set.sort_unstable();
+                set.dedup();
+                set
+            };
+            for cell in cells {
+                let text = gridcraft_engine::display::cell_text(&self.workbook, sh, cell);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let range = sh
+                    .merges
+                    .iter()
+                    .find(|m| m.start == cell)
+                    .copied()
+                    .unwrap_or_else(|| RangeRef::cell(cell));
+                let (cx, cy, cw, ch) = b.rect(range);
+                let cell_rect = (cw > 0.0 && ch > 0.0).then(|| {
+                    KurboRect::new(
+                        f64::from(cx),
+                        f64::from(cy),
+                        f64::from(cx + cw),
+                        f64::from(cy + ch),
+                    )
+                });
+                placed_cells.push((
+                    *rsi,
+                    cell.row,
+                    *csi,
+                    cell.col,
+                    trimmed.to_string(),
+                    cell_rect,
+                ));
             }
+        }
+        placed_cells.sort_by_key(|&(rsi, row, csi, col, _, _)| (rsi, row, csi, col));
+        let mut current_row: Option<(usize, u32)> = None;
+        for (rsi, row, _, _, trimmed, cell_rect) in placed_cells {
             match current_row {
-                Some(r) if r == cell.row => {
+                Some(r) if r == (rsi, row) => {
                     raw.push('\t');
                     char_rects.push(None);
                 }
@@ -658,25 +693,8 @@ impl ExcelDocument {
                 }
                 None => {}
             }
-            current_row = Some(cell.row);
-            let cell_rect = body_block.as_ref().and_then(|b| {
-                let range = sh
-                    .merges
-                    .iter()
-                    .find(|m| m.start == cell)
-                    .copied()
-                    .unwrap_or_else(|| RangeRef::cell(cell));
-                let (cx, cy, cw, ch) = b.rect(range);
-                (cw > 0.0 && ch > 0.0).then(|| {
-                    KurboRect::new(
-                        f64::from(cx),
-                        f64::from(cy),
-                        f64::from(cx + cw),
-                        f64::from(cy + ch),
-                    )
-                })
-            });
-            push_str(&mut raw, &mut char_rects, trimmed, cell_rect);
+            current_row = Some((rsi, row));
+            push_str(&mut raw, &mut char_rects, &trimmed, cell_rect);
         }
         if current_row.is_some() {
             raw.push('\n');
@@ -1298,14 +1316,11 @@ impl PageCanvas {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], iw: u32, ih: u32) {
+    fn image_pixmap(&mut self, x: f32, y: f32, w: f32, h: f32, pm: Arc<Pixmap>) {
+        let (iw, ih) = (pm.width(), pm.height());
         if w <= 0.0 || h <= 0.0 || iw == 0 || ih == 0 {
             return;
         }
-        let Some(pm) = premul_pixmap(iw, ih, rgba) else {
-            return;
-        };
         let r = kurbo::Rect::new(
             f64::from(x),
             f64::from(y),
@@ -1316,7 +1331,7 @@ impl PageCanvas {
         let sy = r.height() / f64::from(ih.max(1));
         self.ctx.set_transform(self.view);
         self.ctx.set_paint(vello_cpu::Image {
-            image: vello_cpu::ImageSource::Pixmap(Arc::new(pm)),
+            image: vello_cpu::ImageSource::Pixmap(pm),
             sampler: peniko::ImageSampler::default().with_quality(peniko::ImageQuality::Medium),
         });
         self.ctx
@@ -1824,7 +1839,13 @@ fn font_for(style: &Style) -> FontSpec<'_> {
     }
 }
 
-fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Option<CfCache>) {
+fn draw_block(
+    pg: &mut PageCanvas,
+    b: &Block<'_>,
+    gridlines: bool,
+    cf: &mut Option<CfCache>,
+    image_cache: &mut ImageCache,
+) {
     let (bx, by) = (
         b.xs.first().copied().unwrap_or(0.0),
         b.ys.first().copied().unwrap_or(0.0),
@@ -1855,6 +1876,12 @@ fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Opti
                 .map(|(c, _)| *c)
                 .filter(|c| block.contains(*c)),
         );
+        set.extend(
+            sh.cell_pictures
+                .keys()
+                .copied()
+                .filter(|c| block.contains(*c)),
+        );
         set.sort_unstable();
         set.dedup();
         set.retain(|c| !covered(*c));
@@ -1874,6 +1901,7 @@ fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Opti
     let skip = |c: &CellRef| {
         sh.cond_formats.is_empty()
             && sh.value_ref(*c).is_none_or(|v| v.is_empty())
+            && !sh.cell_pictures.contains_key(c)
             && sh.style_id(*c) == StyleId::DEFAULT
             && (sh.tables.is_empty() || sh.table_at(*c).is_none())
     };
@@ -1887,6 +1915,7 @@ fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Opti
                 || l.cf.is_some()
                 || merges.iter().any(|m| m.start == *c)
                 || !sh.value(*c).is_empty()
+                || sh.cell_pictures.contains_key(c)
                 || l.style.borders != Borders::default()
         })
         .collect();
@@ -1962,7 +1991,7 @@ fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Opti
             continue;
         }
         if let Some(picture) = sh.cell_pictures.get(c) {
-            draw_cell_picture(pg, &picture.data, (x, y, w, h), b.k);
+            draw_cell_picture(pg, &picture.data, (x, y, w, h), b.k, image_cache);
         } else {
             draw_text(pg, b, *c, l, (x, y, w, h), merged, &merges, (bx, bx + bw));
         }
@@ -1970,47 +1999,30 @@ fn draw_block(pg: &mut PageCanvas, b: &Block<'_>, gridlines: bool, cf: &mut Opti
     pg.pop_clip();
 }
 
-fn draw_cell_picture(pg: &mut PageCanvas, data: &[u8], rect: (f32, f32, f32, f32), k: f32) {
+fn draw_cell_picture(
+    pg: &mut PageCanvas,
+    data: &[u8],
+    rect: (f32, f32, f32, f32),
+    k: f32,
+    image_cache: &mut ImageCache,
+) {
     let (x, y, w, h) = rect;
     let pad = 2.0 * k;
     let (w, h) = ((w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0));
-    if w <= 0.0 || h <= 0.0 || data.len() > 16 * 1024 * 1024 {
+    if w <= 0.0 || h <= 0.0 {
         return;
     }
-    let Some((iw, ih)) = gridcraft_engine::io::image_size(data) else {
+    let Some((pm, iw, ih)) = decode_cached_pixmap(data, image_cache) else {
         return;
     };
-    if iw == 0 || ih == 0 || iw > 8192 || ih > 8192 || u64::from(iw) * u64::from(ih) > 16_000_000 {
-        return;
-    }
-    let Ok(mut reader) = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()
-    else {
-        return;
-    };
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(limits);
-    let Ok(image) = reader.decode() else {
-        return;
-    };
-    let image = image
-        .thumbnail(
-            ((w / 72.0) * 150.0).ceil().clamp(1.0, 4000.0) as u32,
-            ((h / 72.0) * 150.0).ceil().clamp(1.0, 4000.0) as u32,
-        )
-        .to_rgba8();
     let fit = (w / iw as f32).min(h / ih as f32);
     let (pw, ph) = (iw as f32 * fit, ih as f32 * fit);
-    pg.image_rgba(
+    pg.image_pixmap(
         x + pad + (w - pw) / 2.0,
         y + pad + (h - ph) / 2.0,
         pw,
         ph,
-        image.as_raw(),
-        image.width(),
-        image.height(),
+        pm,
     );
 }
 
@@ -2262,23 +2274,72 @@ fn anchor_rect(sh: &Sheet, a: &Anchor) -> (f64, f64, f64, f64) {
     )
 }
 
-fn decode_image(data: &[u8], max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let (w, h) = gridcraft_engine::io::image_size(data)?;
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 60_000_000 {
+const MAX_CACHED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CACHED_IMAGE_DIM: u32 = 2048;
+const MAX_DECODE_IMAGE_DIM: u32 = 16_384;
+const MAX_DECODE_IMAGE_PIXELS: u64 = 16_000_000;
+const MAX_DECODE_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_CACHE_ENTRIES: usize = 256;
+
+fn decode_cached_pixmap(data: &[u8], image_cache: &mut ImageCache) -> Option<CachedPixmap> {
+    if data.is_empty() || data.len() > MAX_CACHED_IMAGE_BYTES {
         return None;
     }
-    let img = image::load_from_memory(data).ok()?;
-    let img = if img.width() > max_w.max(1) || img.height() > max_h.max(1) {
-        img.thumbnail(max_w.max(1), max_h.max(1))
-    } else {
-        img
-    };
-    let rgba = img.to_rgba8();
-    let (pw, ph) = (rgba.width(), rgba.height());
-    Some((rgba.into_raw(), pw, ph))
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    let key = (hasher.finish(), data.len());
+    if let Some(cached) = image_cache.get(&key) {
+        return cached.clone();
+    }
+
+    let decoded = (|| {
+        let (w, h) = gridcraft_engine::io::image_size(data)?;
+        if w == 0
+            || h == 0
+            || w > MAX_DECODE_IMAGE_DIM
+            || h > MAX_DECODE_IMAGE_DIM
+            || u64::from(w) * u64::from(h) > MAX_DECODE_IMAGE_PIXELS
+        {
+            return None;
+        }
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_DECODE_IMAGE_DIM);
+        limits.max_image_height = Some(MAX_DECODE_IMAGE_DIM);
+        limits.max_alloc = Some(MAX_DECODE_IMAGE_ALLOC);
+        reader.limits(limits);
+        let img = reader.decode().ok()?;
+        let (iw, ih) = (img.width(), img.height());
+        if iw == 0 || ih == 0 {
+            return None;
+        }
+        let img = if iw > MAX_CACHED_IMAGE_DIM || ih > MAX_CACHED_IMAGE_DIM {
+            img.thumbnail(MAX_CACHED_IMAGE_DIM, MAX_CACHED_IMAGE_DIM)
+        } else {
+            img
+        };
+        let rgba = img.to_rgba8();
+        let pm = premul_pixmap(rgba.width(), rgba.height(), rgba.as_raw())?;
+        Some((Arc::new(pm), iw, ih))
+    })();
+
+    if image_cache.len() >= MAX_IMAGE_CACHE_ENTRIES {
+        image_cache.clear();
+    }
+    image_cache.insert(key, decoded.clone());
+    decoded
 }
 
-fn draw_objects(pg: &mut PageCanvas, wb: &Workbook, si: usize, sh: &Sheet, b: &Block<'_>) {
+fn draw_objects(
+    pg: &mut PageCanvas,
+    wb: &Workbook,
+    si: usize,
+    sh: &Sheet,
+    b: &Block<'_>,
+    image_cache: &mut ImageCache,
+) {
     let block = b.range();
     let (sx0, sy0) = (sh.col_left(block.start.col), sh.row_top(block.start.row));
     let (sx1, sy1) = (
@@ -2333,12 +2394,8 @@ fn draw_objects(pg: &mut PageCanvas, wb: &Workbook, si: usize, sh: &Sheet, b: &B
             continue;
         }
         let (x, y, w, h) = place(r);
-        let (mw, mh) = (
-            ((w / 72.0) * 150.0).ceil().clamp(1.0, 4000.0) as u32,
-            ((h / 72.0) * 150.0).ceil().clamp(1.0, 4000.0) as u32,
-        );
-        if let Some((px, pw, ph)) = decode_image(&im.data, mw, mh) {
-            pg.image_rgba(x, y, w, h, &px, pw, ph);
+        if let Some((pm, _, _)) = decode_cached_pixmap(&im.data, image_cache) {
+            pg.image_pixmap(x, y, w, h, pm);
         }
     }
     for shp in &sh.shapes {
@@ -2598,5 +2655,118 @@ fn seg_size(sh: &Sheet, seg: (u32, u32), rows: bool) -> f32 {
         (seg.0..=seg.1).map(|r| sh.row_height(r)).sum()
     } else {
         (seg.0..=seg.1).map(|c| sh.col_width(c)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_title_rows_and_cols_appear_in_subsequent_page_text_and_bboxes() {
+        let mut wb = Workbook::new();
+        {
+            let sh = Arc::make_mut(&mut wb.sheets[0]);
+            sh.name = "Titles".to_string();
+            sh.set_value(CellRef::new(0, 0), Value::from("CornerTitle"));
+            sh.set_value(CellRef::new(0, 2), Value::from("Col2Header"));
+            sh.set_value(CellRef::new(5, 0), Value::from("Row5Label"));
+            sh.set_value(CellRef::new(5, 2), Value::from("PageBodyValue"));
+            sh.print.title_rows = Some((0, 0));
+            sh.print.title_cols = Some((0, 0));
+        }
+
+        let opts = PrintOptions::default();
+        let mut lay = layout_sheet(
+            &wb,
+            0,
+            &opts,
+            Some(RangeRef::new(CellRef::new(0, 0), CellRef::new(5, 2))),
+        )
+        .expect("sheet layout should build");
+        lay.row_bands = vec![(1, 4), (5, 5)];
+        lay.col_bands = vec![(1, 1), (2, 2)];
+        lay.pages = vec![(0, 0), (1, 1)];
+
+        let doc = ExcelDocument {
+            workbook: wb,
+            layouts: vec![lay],
+            pages: vec![
+                ExcelPageSpec {
+                    layout_idx: 0,
+                    sheet_page_idx: 0,
+                    row_band: (1, 4),
+                    col_band: (1, 1),
+                },
+                ExcelPageSpec {
+                    layout_idx: 0,
+                    sheet_page_idx: 1,
+                    row_band: (5, 5),
+                    col_band: (2, 2),
+                },
+            ],
+            meta_cache: vec![OnceCell::new(), OnceCell::new()],
+            image_cache: RefCell::new(HashMap::new()),
+            file_name: "titles.xlsx".to_string(),
+            file_path: "titles.xlsx".to_string(),
+        };
+
+        let cached = doc.extract_cached_text(1);
+        let text = &cached.raw;
+        assert!(text.contains("CornerTitle"), "text was: {text:?}");
+        assert!(text.contains("Col2Header"), "text was: {text:?}");
+        assert!(text.contains("Row5Label"), "text was: {text:?}");
+        assert!(text.contains("PageBodyValue"), "text was: {text:?}");
+
+        let corner_pos = text.find("CornerTitle").unwrap();
+        let body_pos = text.find("PageBodyValue").unwrap();
+        let corner_char_idx = text[..corner_pos].chars().count();
+        let body_char_idx = text[..body_pos].chars().count();
+        let corner_rect = cached.char_rects[corner_char_idx].expect("corner char rect");
+        let body_rect = cached.char_rects[body_char_idx].expect("body char rect");
+        assert!(
+            corner_rect.x1 <= body_rect.x0 + 0.5,
+            "repeated title column rect {:?} should sit left of body rect {:?}",
+            corner_rect,
+            body_rect
+        );
+        assert!(
+            corner_rect.y1 <= body_rect.y0 + 0.5,
+            "repeated title row rect {:?} should sit above body rect {:?}",
+            corner_rect,
+            body_rect
+        );
+    }
+
+    #[test]
+    fn decode_cached_pixmap_reuses_arc_pixmap_and_rejects_oversized_png_headers() {
+        let mut png_bytes = Vec::new();
+        {
+            let img = image::RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 255]));
+            img.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode tiny png");
+        }
+
+        let mut cache = ImageCache::new();
+        let (pm1, w1, h1) =
+            decode_cached_pixmap(&png_bytes, &mut cache).expect("first decode should succeed");
+        let (pm2, w2, h2) =
+            decode_cached_pixmap(&png_bytes, &mut cache).expect("cached decode should succeed");
+        assert_eq!((w1, h1), (4, 3));
+        assert_eq!((w2, h2), (4, 3));
+        assert!(
+            Arc::ptr_eq(&pm1, &pm2),
+            "second decode should return cached Arc<Pixmap>"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // Craft a PNG header claiming 20000x20000 dimensions; it must be rejected before decode.
+        let mut oversized_png = png_bytes.clone();
+        oversized_png[16..20].copy_from_slice(&20_000u32.to_be_bytes());
+        oversized_png[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+        assert!(decode_cached_pixmap(&oversized_png, &mut cache).is_none());
     }
 }
