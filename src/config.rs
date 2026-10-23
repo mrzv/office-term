@@ -20,6 +20,7 @@ pub struct Config {
     link_picker_split_percent: Option<u16>,
     link_picker_layout: LinkPickerLayout,
     forward_socket: Option<String>,
+    pub max_file_size_mib: u32,
     pub viewer: ViewerSettings,
 }
 
@@ -61,6 +62,9 @@ impl Config {
             Err(error) => return Err(error.into()),
         }
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        if config.max_file_size_mib == 0 {
+            return Err("max_file_size_mib must be at least 1".into());
+        }
         let viewer = &config.viewer;
         for (name, value, low, high) in [
             ("scroll_frame_ms", viewer.scroll_frame_ms, 1, 1000),
@@ -212,6 +216,7 @@ impl Default for Config {
             link_picker_split_percent: None,
             link_picker_layout: LinkPickerLayout::Auto,
             forward_socket: Some("forward.sock".into()),
+            max_file_size_mib: 256,
             viewer: ViewerSettings::default(),
         }
     }
@@ -374,5 +379,20 @@ mod tests {
         );
         fs::write(&path, "[viewer]\nscroll_frame_ms = 0\n").unwrap();
         assert!(Config::load_path(&path).is_err());
+    }
+
+    #[test]
+    fn file_size_limit_rejects_zero_and_accepts_large_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for invalid in ["0", "-1", "4294967296"] {
+            fs::write(&path, format!("max_file_size_mib = {invalid}\n")).unwrap();
+            assert!(Config::load_path(&path).is_err(), "accepted {invalid}");
+        }
+        fs::write(&path, "max_file_size_mib = 4294967295\n").unwrap();
+        assert_eq!(
+            Config::load_path(&path).unwrap().max_file_size_mib,
+            u32::MAX
+        );
     }
 }

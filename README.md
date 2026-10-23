@@ -76,6 +76,19 @@ Configuration lives at `$XDG_CONFIG_HOME/officeterm/config.toml`, or
 length and private-directory requirements apply only when `--session` enables
 viewer control; ordinary viewing does not create the socket directory.
 
+`max_file_size_mib = 256` limits document size on disk before reading the file.
+Set a positive integer MiB value in the configuration, or override it for one
+viewer process:
+
+```sh
+oterm --max-file-size-mib 1024 path/to/large-document.xlsx
+```
+
+The CLI value takes precedence without modifying the configuration file. The
+same limit applies to startup, file-picker opens, links, and reloads. It is not
+a memory budget: parsing and decompression can use substantially more memory
+than the file size. Importer and image-decoding safeguards remain unchanged.
+
 Recent-file history stores Unix path bytes in JSON, preserving newlines and
 non-UTF8 filenames. The previous newline-delimited history is ignored and replaced
 when a document is next recorded.

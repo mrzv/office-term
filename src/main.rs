@@ -13,6 +13,10 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     page: u32,
 
+    /// Maximum document file size in MiB; overrides the configuration.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_file_size_mib: Option<u32>,
+
     /// Print the shared configuration as JSON (also creates the default file).
     #[arg(long)]
     print_config: bool,
@@ -35,6 +39,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(limit) = cli.max_file_size_mib {
+        config.max_file_size_mib = limit;
+    }
     if let Err(error) = config.select_session(cli.session.as_deref()) {
         eprintln!("oterm: {error}");
         return ExitCode::FAILURE;

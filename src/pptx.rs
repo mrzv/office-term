@@ -416,7 +416,10 @@ fn prepare_macos_font_home(home: &Path, cache_base: &Path) -> io::Result<PathBuf
 }
 
 impl PptxWorker {
-    pub fn spawn(path: PathBuf) -> Result<(Self, u32, Vec<OutlineItem>, DocumentRevision), String> {
+    pub fn spawn(
+        path: PathBuf,
+        max_file_size_mib: u32,
+    ) -> Result<(Self, u32, Vec<OutlineItem>, DocumentRevision), String> {
         let (command_tx, command_rx) = unbounded();
         let (message_tx, message_rx) = unbounded();
         let generation = Arc::new(AtomicU64::new(0));
@@ -427,6 +430,7 @@ impl PptxWorker {
         let handle = thread::spawn(move || {
             worker_loop(
                 path,
+                max_file_size_mib,
                 command_rx,
                 message_tx,
                 worker_generation,
@@ -720,8 +724,6 @@ impl PendingCommands {
     }
 }
 
-const MAX_DOCUMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
-
 fn load_presentation_from_bytes(path: &Path, bytes: &[u8]) -> Result<Presentation, String> {
     if deckcraft_pptx::is_encrypted(bytes) {
         return Err(format!(
@@ -901,12 +903,13 @@ fn remap_presentation_fonts(presentation: &mut Presentation, aliases: &FontAlias
 
 fn open_presentation(
     path: &Path,
+    max_file_size_mib: u32,
 ) -> Result<(OpenPresentation, u32, Vec<OutlineItem>, DocumentRevision), String> {
     let revision = DocumentRevision::read(path)
         .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-    if revision.len > MAX_DOCUMENT_FILE_BYTES {
+    if revision.len > u64::from(max_file_size_mib) * 1024 * 1024 {
         return Err(format!(
-            "{} exceeds maximum supported file size (256 MiB)",
+            "{} exceeds the configured file size limit ({max_file_size_mib} MiB); raise max_file_size_mib or use --max-file-size-mib",
             path.display()
         ));
     }
@@ -1056,12 +1059,14 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 fn worker_loop(
     path: PathBuf,
+    max_file_size_mib: u32,
     commands: Receiver<WorkerCommand>,
     messages: Sender<WorkerMessage>,
     latest_generation: Arc<AtomicU64>,
     link_index_epoch: Arc<AtomicU64>,
 ) {
-    let (initial_doc, pages, outline, revision) = match open_presentation(&path) {
+    let (initial_doc, pages, outline, revision) = match open_presentation(&path, max_file_size_mib)
+    {
         Ok(opened) => opened,
         Err(error) => {
             let _ = messages.send(WorkerMessage::Error(error));
@@ -1104,7 +1109,7 @@ fn worker_loop(
         }
 
         if let Some((document_id, path)) = pending.opens.pop_front() {
-            match open_presentation(&path) {
+            match open_presentation(&path, max_file_size_mib) {
                 Ok((doc, pages, outline, revision)) => {
                     documents.insert(document_id, doc);
                     if active_link_index.is_some_and(|active| active.document_id == document_id) {
@@ -2866,7 +2871,7 @@ mod tests {
         let path = dir.path().join("deck.pptx");
         std::fs::write(&path, sample_pptx_bytes()).unwrap();
 
-        let (mut doc, pages, outline, _) = open_presentation(&path).unwrap();
+        let (mut doc, pages, outline, _) = open_presentation(&path, 256).unwrap();
         assert_eq!(pages, 1);
         assert_eq!(outline.len(), 1);
         assert_eq!(outline[0].title, "Quarterly Overview");
@@ -3100,11 +3105,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, b"not an office file").unwrap();
-        let err = match open_presentation(&path) {
+        let err = match open_presentation(&path, 256) {
             Ok(_) => panic!("expected unsupported format error"),
             Err(err) => err,
         };
         assert!(err.contains("unsupported document format"), "got: {err}");
+    }
+
+    #[test]
+    fn file_size_limit_applies_to_startup_and_later_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = dir.path().join("boundary.rtf");
+        let oversized = dir.path().join("oversized.rtf");
+        let padded_rtf = |len: usize| {
+            let mut bytes = vec![b' '; len];
+            let prefix = b"{\\rtf1 Hello{\\*\\comment ";
+            bytes[..prefix.len()].copy_from_slice(prefix);
+            bytes[len - 2..].copy_from_slice(b"}}");
+            bytes
+        };
+        std::fs::write(&boundary, padded_rtf(1024 * 1024)).unwrap();
+        std::fs::write(&oversized, padded_rtf(1024 * 1024 + 1)).unwrap();
+
+        let error = match PptxWorker::spawn(oversized.clone(), 1) {
+            Ok(_) => panic!("oversized document opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("1 MiB"), "{error}");
+        let (worker, pages, _, _) = PptxWorker::spawn(boundary.clone(), 1).unwrap();
+        assert_eq!(pages, 1);
+        worker.open(2, oversized.clone()).unwrap();
+        match worker.messages.recv().unwrap() {
+            WorkerMessage::OpenError {
+                document_id: 2,
+                error,
+            } => {
+                assert!(error.contains("1 MiB"), "{error}");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        worker.open(3, boundary).unwrap();
+        assert!(matches!(
+            worker.messages.recv().unwrap(),
+            WorkerMessage::Opened {
+                document_id: 3,
+                pages: 1,
+                ..
+            }
+        ));
+
+        let (larger_limit, pages, _, _) = PptxWorker::spawn(oversized, 2).unwrap();
+        assert_eq!(pages, 1);
+        larger_limit.extract_text(1, 0).unwrap();
+        match larger_limit.messages.recv().unwrap() {
+            WorkerMessage::Text { content, .. } => assert!(content.contains("Hello")),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]
@@ -3167,7 +3223,7 @@ mod tests {
         let path = dir.path().join("links.pptx");
         std::fs::write(&path, deckcraft_pptx::export(&pres).unwrap()).unwrap();
 
-        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+        let (mut doc, _, _, _) = open_presentation(&path, 256).unwrap();
         let indexed = index_slide_links(&mut doc, 0);
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].label, "here");
@@ -3302,7 +3358,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("search.pptx");
         std::fs::write(&path, sample_pptx_bytes()).unwrap();
-        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+        let (mut doc, _, _, _) = open_presentation(&path, 256).unwrap();
         let (commands, incoming) = unbounded();
         let (messages, results) = unbounded();
         let mut pending = PendingCommands::new();
@@ -3414,6 +3470,7 @@ mod tests {
         drop(commands);
         worker_loop(
             path,
+            256,
             incoming,
             messages,
             Arc::new(AtomicU64::new(0)),
@@ -3494,7 +3551,7 @@ mod tests {
         let path = dir.path().join("multi.pptx");
         std::fs::write(&path, deckcraft_pptx::export(&pres).unwrap()).unwrap();
 
-        let (worker, pages, _, _) = PptxWorker::spawn(path).unwrap();
+        let (worker, pages, _, _) = PptxWorker::spawn(path, 256).unwrap();
         assert_eq!(pages, 3);
 
         let key_for = |page: u32, zoom: u16| RenderKey {
@@ -3582,7 +3639,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zoom.pptx");
         std::fs::write(&path, sample_pptx_bytes()).unwrap();
-        let (mut doc, _, _, _) = open_presentation(&path).unwrap();
+        let (mut doc, _, _, _) = open_presentation(&path, 256).unwrap();
 
         for zoom in [100u16, 110, 125, 200, 400] {
             let key = RenderKey {
@@ -3657,7 +3714,7 @@ mod tests {
         ];
         std::fs::write(&docx_path, wordcraft_docx::write(&word_doc).unwrap()).unwrap();
 
-        let (mut wdoc, wpages, woutline, _) = open_presentation(&docx_path).unwrap();
+        let (mut wdoc, wpages, woutline, _) = open_presentation(&docx_path, 256).unwrap();
         assert!(wpages >= 1);
         assert_eq!(woutline.len(), 1);
         assert_eq!(woutline[0].title, "Executive Summary");
@@ -3704,7 +3761,7 @@ mod tests {
         )
         .unwrap();
 
-        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path).unwrap();
+        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path, 256).unwrap();
         assert!(epages >= 1);
         assert_eq!(eoutline.len(), 1);
         assert_eq!(eoutline[0].title, "Financials");
@@ -3763,7 +3820,7 @@ mod tests {
         )
         .unwrap();
 
-        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path).unwrap();
+        let (mut edoc, epages, eoutline, _) = open_presentation(&xlsx_path, 256).unwrap();
         assert_eq!(epages, 1);
         assert_eq!(eoutline.len(), 1);
         let etext = extract_slide_text(&mut edoc, 0);
@@ -3785,7 +3842,7 @@ mod tests {
         )
         .unwrap();
 
-        let (mut sdoc, spages, _, _) = open_presentation(&sparse_path).unwrap();
+        let (mut sdoc, spages, _, _) = open_presentation(&sparse_path, 256).unwrap();
         assert_eq!(spages, 2);
         assert!(extract_slide_text(&mut sdoc, 0).contains("Top block"));
         assert!(extract_slide_text(&mut sdoc, 1).contains("Bottom block"));

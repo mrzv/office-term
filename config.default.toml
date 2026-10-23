@@ -3,6 +3,7 @@
 # XDG_CONFIG_HOME overrides ~/.config. Restart viewer after editing.
 
 fit_mode = "page"                  # page, width, height, or content
+max_file_size_mib = 256             # Maximum document size on disk; positive MiB, CLI --max-file-size-mib overrides
 dark_mode = false                  # Invert page/slide colors using the selected theme
 theme = ""                         # Empty: built-in palette; otherwise a theme TOML path
 theme_catalog = ""                 # Empty: no external catalog; otherwise a catalog TOML path

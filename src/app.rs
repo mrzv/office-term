@@ -148,7 +148,7 @@ pub fn run(path: Option<PathBuf>, start_page: u32, config: &Config) -> Result<()
         },
     };
     let (worker, page_count, outline, revision) =
-        PptxWorker::spawn(path.clone()).map_err(AppError::Renderer)?;
+        PptxWorker::spawn(path.clone(), config.max_file_size_mib).map_err(AppError::Renderer)?;
     crate::recent::record(&path);
     let watcher = FileWatcher::new(&path)?;
     let mut app = App::new(
