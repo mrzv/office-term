@@ -22,6 +22,8 @@ pub struct Config {
     forward_socket: Option<String>,
     pub max_file_size_mib: u32,
     pub viewer: ViewerSettings,
+    #[serde(skip)]
+    reload_context: ReloadContext,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
@@ -44,13 +46,37 @@ pub enum LinkPickerLayout {
     Floating,
 }
 
+/// Process-only choices that must remain authoritative when reloading the file.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReloadContext {
+    path: Option<PathBuf>,
+    max_file_size_override: Option<u32>,
+    session: Option<String>,
+}
+
+impl ReloadContext {
+    pub(crate) fn load(&self) -> Result<Config, Box<dyn std::error::Error>> {
+        let mut config = match &self.path {
+            Some(path) => {
+                Config::load_path(path).map_err(|error| format!("{}: {error}", path.display()))?
+            }
+            None => Config::load()?,
+        };
+        config.set_max_file_size_override(self.max_file_size_override);
+        // Even an unnamed process must reapply its selection: the file's default
+        // socket must never accidentally turn it into a controllable session.
+        config.select_session(self.session.as_deref())?;
+        Ok(config)
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = config_path().ok_or("HOME or XDG_CONFIG_HOME must be set")?;
         Self::load_path(&path).map_err(|error| format!("{}: {error}", path.display()).into())
     }
 
-    fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn load_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(path.parent().ok_or("config path has no parent")?)?;
         match fs::OpenOptions::new()
             .write(true)
@@ -100,6 +126,7 @@ impl Config {
                 .into_string()
                 .map_err(|_| "socket path must be UTF-8")?;
         }
+        config.reload_context.path = Some(path.to_owned());
         Ok(config)
     }
 
@@ -109,6 +136,7 @@ impl Config {
             if let Some(socket) = self.forward_socket.as_mut() {
                 socket.clear();
             }
+            self.reload_context.session = None;
             return Ok(());
         };
         if name.is_empty()
@@ -144,7 +172,20 @@ impl Config {
                 .into_string()
                 .map_err(|_| io::Error::other("socket path is not UTF-8"))?;
         }
+        self.reload_context.session = Some(name.to_owned());
         Ok(())
+    }
+
+    /// Set the command-line size limit, retaining its precedence across reloads.
+    pub fn set_max_file_size_override(&mut self, limit: Option<u32>) {
+        self.reload_context.max_file_size_override = limit;
+        if let Some(limit) = limit {
+            self.max_file_size_mib = limit;
+        }
+    }
+
+    pub(crate) fn reload_context(&self) -> ReloadContext {
+        self.reload_context.clone()
     }
 
     pub fn fit_mode(&self) -> FitMode {
@@ -218,6 +259,7 @@ impl Default for Config {
             forward_socket: Some("forward.sock".into()),
             max_file_size_mib: 256,
             viewer: ViewerSettings::default(),
+            reload_context: ReloadContext::default(),
         }
     }
 }
@@ -393,6 +435,75 @@ mod tests {
         assert_eq!(
             Config::load_path(&path).unwrap().max_file_size_mib,
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn reload_preserves_cli_limit_and_named_session_for_new_endpoint() {
+        let directory = tempfile::Builder::new()
+            .prefix("oterm-reload-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::load_path(&path).unwrap();
+        config.set_max_file_size_override(Some(512));
+        config.select_session(Some("demo")).unwrap();
+        let context = config.reload_context();
+        fs::write(
+            &path,
+            "max_file_size_mib = 1\nforward_socket = \"changed.sock\"\n",
+        )
+        .unwrap();
+        let reloaded = context.load().unwrap();
+        assert_eq!(reloaded.max_file_size_mib, 512);
+        assert_eq!(
+            reloaded.forward_socket(),
+            Some(
+                directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("run/demo-changed.sock")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        // Repeated reloads must not accumulate the session prefix.
+        assert_eq!(
+            reloaded.reload_context().load().unwrap().forward_socket(),
+            reloaded.forward_socket()
+        );
+    }
+
+    #[test]
+    fn reload_without_cli_overrides_uses_new_limit_but_keeps_control_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::load_path(&path).unwrap();
+        config.select_session(None).unwrap();
+        fs::write(&path, "max_file_size_mib = 7\n").unwrap();
+        let reloaded = config.reload_context().load().unwrap();
+        assert_eq!(reloaded.max_file_size_mib, 7);
+        assert_eq!(reloaded.forward_socket(), None);
+        assert!(!directory.path().join("run").exists());
+    }
+
+    #[test]
+    fn failed_reload_keeps_previous_config_and_process_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::load_path(&path).unwrap();
+        config.select_session(None).unwrap();
+        config.set_max_file_size_override(Some(512));
+        fs::write(&path, "[viewer]\nscroll_frame_ms = 0\n").unwrap();
+        assert!(config.reload_context().load().is_err());
+        assert_eq!(config.max_file_size_mib, 512);
+        assert_eq!(config.viewer.scroll_frame_ms, 16);
+        assert_eq!(config.forward_socket(), None);
+        fs::write(&path, "max_file_size_mib = 1\n").unwrap();
+        assert_eq!(
+            config.reload_context().load().unwrap().max_file_size_mib,
+            512
         );
     }
 }

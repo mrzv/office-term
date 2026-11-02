@@ -34,6 +34,8 @@ use crate::pptx::{
 };
 use crate::terminal::{ImagePlacement, TerminalGuard, Viewport};
 use crate::theme::Palette;
+mod history;
+mod reload;
 mod scale;
 mod session;
 mod status;
@@ -296,6 +298,7 @@ struct App {
     smooth_scroll_tick: Instant,
     title_document: Option<DocumentId>,
     viewer: ViewerSettings,
+    reload_context: crate::config::ReloadContext,
     next_image_id: u32,
     last_status_row: Option<u16>,
     status_line: Vec<u8>,
@@ -335,39 +338,14 @@ struct AppDefaults {
     link_picker_geometry: LinkPickerGeometry,
     forward_socket: Option<String>,
     viewer: ViewerSettings,
+    reload_context: crate::config::ReloadContext,
 }
 
 impl AppDefaults {
     fn from_config(config: &Config) -> Self {
         let themes = crate::theme::available_themes(config.theme_catalog(), config.theme());
         let configured_theme = crate::theme::load_or_default(config.theme());
-        let theme_index = themes
-            .iter()
-            .position(|(_, theme)| *theme == configured_theme)
-            .unwrap_or(0);
-        let theme = themes
-            .get(theme_index)
-            .map_or(configured_theme, |(_, theme)| *theme);
-        Self {
-            fit: config.fit_mode(),
-            invert: config.dark_mode(),
-            dark_mode_style: DarkModeStyle::new(
-                theme.document.background,
-                theme.document.foreground,
-            ),
-            search_highlight: terminal_color_rgb(theme.yellow),
-            link_highlight: terminal_color_rgb(theme.cyan),
-            persistent_link_picker: config.persistent_link_picker(),
-            link_picker_geometry: LinkPickerGeometry::new(
-                config.link_picker_split_percent(),
-                config.link_picker_layout(),
-            ),
-            forward_socket: config.forward_socket().map(str::to_owned),
-            viewer: config.viewer.clone(),
-            theme,
-            themes,
-            theme_index,
-        }
+        Self::from_config_with_themes(config, themes, configured_theme)
     }
 }
 
@@ -730,7 +708,7 @@ impl App {
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
                     search: SearchState::default(),
-                    link_history: Vec::new(),
+                    link_history: history::JumpList::default(),
                     pending_destination: None,
                     link_index: LinkIndexState::new(page_count),
                 }],
@@ -777,6 +755,7 @@ impl App {
             themes: defaults.themes,
             theme_index: defaults.theme_index,
             viewer: defaults.viewer,
+            reload_context: defaults.reload_context,
         }
     }
 
@@ -1455,6 +1434,10 @@ impl App {
                         self.draw_status(output, self.viewport()?, "screenshot saved")?;
                     }
                 }
+                Ok(crate::ipc::ViewerRequest::Quit) => {
+                    reply.finish(None);
+                    return Err(AppError::Quit);
+                }
                 Err(error) => {
                     reply.finish(Some(error.to_string()));
                     self.draw_status(
@@ -1677,63 +1660,6 @@ impl App {
             self.close_link_picker(output)?;
         }
         self.follow_link(target, output)
-    }
-
-    fn follow_link(&mut self, target: LinkTarget, output: &mut impl Write) -> Result<(), AppError> {
-        match target {
-            LinkTarget::Internal {
-                page,
-                top_ratio,
-                left_ratio,
-            } => {
-                let current = ViewPosition {
-                    page: self.tab().page,
-                    scroll_x: self.tab().scroll_x,
-                    scroll_y: self.tab().scroll_y,
-                    center_content: self.tab().center_content,
-                };
-                let page = page.min(self.tab().page_count.saturating_sub(1));
-                let tab = self.tab_mut();
-                if tab.link_history.len() == 100 {
-                    tab.link_history.remove(0);
-                }
-                tab.link_history.push(current);
-                tab.page = page;
-                tab.center_content = true;
-                if top_ratio.is_some() {
-                    tab.scroll_y = 0;
-                }
-                tab.pending_destination = Some(LinkDestination {
-                    page,
-                    top_ratio,
-                    left_ratio,
-                });
-                self.request_current(output)?;
-            }
-            LinkTarget::Uri(uri) => {
-                if uri.trim().is_empty() {
-                    self.draw_status(output, self.viewport()?, "empty link")?;
-                } else {
-                    write_clipboard_osc52(output, &uri)?;
-                    self.draw_status(output, self.viewport()?, "copied link to clipboard")?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn follow_link_back(&mut self, output: &mut impl Write) -> Result<(), AppError> {
-        let Some(previous) = self.tab_mut().link_history.pop() else {
-            self.draw_status(output, self.viewport()?, "no link history")?;
-            return Ok(());
-        };
-        let tab = self.tab_mut();
-        tab.page = previous.page.min(tab.page_count.saturating_sub(1));
-        tab.scroll_x = previous.scroll_x;
-        tab.scroll_y = previous.scroll_y;
-        tab.center_content = previous.center_content;
-        tab.pending_destination = None;
-        self.request_current(output)
     }
 
     fn open_link_picker(&mut self, output: &mut impl Write) -> Result<(), AppError> {
@@ -1983,14 +1909,15 @@ impl App {
             }
             return self.redraw_search_picker(output);
         }
+        let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => return self.close_search_picker(output),
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if plain => {
                 self.close_search_picker(output)?;
                 return self.begin_search(output);
             }
-            KeyCode::Char('s') => return self.cycle_link_picker_layout(output),
-            KeyCode::Char('a') => {
+            KeyCode::Char('s') if plain => return self.cycle_link_picker_layout(output),
+            KeyCode::Char('a') if plain => {
                 return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
             }
             _ => {}
@@ -2034,8 +1961,7 @@ impl App {
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
         let filtering = self
             .link_picker
             .as_ref()
@@ -2075,25 +2001,31 @@ impl App {
                 return self.redraw_link_picker(output);
             }
             KeyCode::Esc => return self.close_link_picker(output),
-            KeyCode::Char('/') if !filtering && !control && !alt => {
+            KeyCode::Char('/') if !filtering && plain => {
                 let state = self.link_picker.as_mut().expect("link picker state");
                 state.filtering = true;
                 state.focus = LinkPickerFocus::Links;
                 state.number_input.clear();
                 return self.redraw_link_picker(output);
             }
-            KeyCode::Char('s') if !filtering => return self.cycle_link_picker_layout(output),
-            KeyCode::Char('a') if !filtering => {
+            KeyCode::Char('s') if !filtering && plain => {
+                return self.cycle_link_picker_layout(output);
+            }
+            KeyCode::Char('a') if !filtering && plain => {
                 return self.set_link_picker_layout(LinkPickerLayout::Auto, output);
             }
-            KeyCode::Char('L') if !filtering => {
+            KeyCode::Char('L') if !filtering && plain => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
-            KeyCode::Char('q') if !filtering => {
+            KeyCode::Char('q') if !filtering && plain => {
                 return self.close_link_picker_and_exit_link_mode(output);
             }
-            KeyCode::Char('b') if !filtering && !control && !alt => {
+            KeyCode::Char('b') if !filtering && plain => {
                 self.follow_link_back(output)?;
+                return Ok(());
+            }
+            KeyCode::Char('B') if !filtering && plain => {
+                self.follow_link_forward(output)?;
                 return Ok(());
             }
             _ => {}
@@ -2129,7 +2061,7 @@ impl App {
                     state.filter.pop();
                     true
                 }
-                KeyCode::Char(character) if !control && !alt => {
+                KeyCode::Char(character) if plain => {
                     state.filter.push(character);
                     true
                 }
@@ -2179,7 +2111,7 @@ impl App {
                     }
                     redraw = true;
                 }
-                KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                KeyCode::Char(digit) if plain && digit.is_ascii_digit() => {
                     if let Some(index) =
                         update_link_number_selection(&mut state.number_input, digit, filtered.len())
                     {
@@ -2217,6 +2149,11 @@ impl App {
         key: KeyEvent,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        if matches!(key.code, KeyCode::Char(_))
+            && !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        {
+            return Ok(());
+        }
         if matches!(
             key.code,
             KeyCode::Down
@@ -2293,6 +2230,14 @@ impl App {
             return Ok(false);
         }
         match key.code {
+            KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+                self.follow_link_back(output)?;
+            }
+            KeyCode::Char('i') if key.modifiers == KeyModifiers::CONTROL => {
+                self.follow_link_forward(output)?;
+            }
+            KeyCode::Char(_)
+                if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {}
             KeyCode::Char('?') => self.open_help(output)?,
             KeyCode::Char('q') if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Char('q') => return self.close_current(output),
@@ -2302,11 +2247,13 @@ impl App {
             KeyCode::Char('N') => self.navigate_search(false, output)?,
             KeyCode::Char('L') => self.toggle_link_mode(output)?,
             KeyCode::Char('b') => self.follow_link_back(output)?,
+            KeyCode::Char('B') => self.follow_link_forward(output)?,
             KeyCode::Enter => self.open_link_picker(output)?,
             KeyCode::Esc if self.link_mode => self.set_link_mode(false, output)?,
             KeyCode::Esc if self.clear_search(output)? => {}
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('f') => self.open_picker(output)?,
+            KeyCode::Char('R') => self.reload_config(output)?,
             KeyCode::Char('D')
                 if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
             {
@@ -3049,9 +2996,14 @@ impl App {
         viewport: Viewport,
         output: &mut impl Write,
     ) -> Result<(), AppError> {
+        let mut resolved_destination = false;
         if let Some(destination) = self.tab_mut().pending_destination.take()
             && destination.page == frame.key.page
         {
+            resolved_destination = self
+                .link_picker
+                .as_ref()
+                .is_none_or(|state| state.preview_origin.is_none());
             if let Some(left_ratio) = destination.left_ratio {
                 let target_x = left_ratio * frame.width as f32;
                 self.tab_mut().scroll_x = horizontal_scroll_to_reveal(
@@ -3070,7 +3022,11 @@ impl App {
             && self.link_picker.is_none()
             && self.search_picker.is_none()
         {
-            return self.draw_continuous(frame, viewport, output);
+            self.draw_continuous(frame, viewport, output)?;
+            if resolved_destination {
+                self.update_history_tip();
+            }
+            return Ok(());
         }
         self.retain_primary_image(output)?;
         let tab = self.tab();
@@ -3082,6 +3038,9 @@ impl App {
         );
         self.tab_mut().scroll_x = i64::from(placement.scroll_x);
         self.tab_mut().scroll_y = placement.scroll_y;
+        if resolved_destination {
+            self.update_history_tip();
+        }
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
         let original = PositionedImage {
@@ -3212,7 +3171,11 @@ impl App {
         }
         // Kitty (image id, p=1) replaces the old placement, including its crop.
         // Only text/UI or geometry changes require clearing the canvas.
-        if old_pages.is_empty() || self.canvas_viewport != Some(viewport) {
+        if old_pages
+            .first()
+            .is_none_or(|old| old.frame.key.document_id != frame.key.document_id)
+            || self.canvas_viewport != Some(viewport)
+        {
             self.prepare_image_canvas(output, viewport)?;
         }
         let started = Instant::now();
@@ -3349,6 +3312,10 @@ impl App {
             return self
                 .visible_pages
                 .iter()
+                .filter(|page| {
+                    same_render_view(page.frame.key, self.render_key(viewport))
+                        && page.frame.revision == self.tab().revision
+                })
                 .find(|page| {
                     mouse.row.checked_sub(page.top).is_some_and(|row| {
                         page.placement
@@ -4094,9 +4061,10 @@ fn link_picker_focus_for_key(
     if layout == LinkPickerLayout::Floating {
         return None;
     }
+    let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Char('h') => Some(LinkPickerFocus::Document),
-        KeyCode::Char('l') => Some(LinkPickerFocus::Links),
+        KeyCode::Char('h') if plain => Some(LinkPickerFocus::Document),
+        KeyCode::Char('l') if plain => Some(LinkPickerFocus::Links),
         KeyCode::Tab | KeyCode::BackTab => Some(match current {
             LinkPickerFocus::Document => LinkPickerFocus::Links,
             LinkPickerFocus::Links => LinkPickerFocus::Document,
@@ -4231,15 +4199,17 @@ fn link_picker_navigation_index(
     if link_count == 0 {
         return None;
     }
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let control = key.modifiers == KeyModifiers::CONTROL;
+    let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Down | KeyCode::Char('j') => Some((selected + 1) % link_count),
-        KeyCode::Up | KeyCode::Char('k') => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
+        KeyCode::Down => Some((selected + 1) % link_count),
+        KeyCode::Up => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
+        KeyCode::Char('j') if plain => Some((selected + 1) % link_count),
+        KeyCode::Char('k') if plain => Some(selected.checked_sub(1).unwrap_or(link_count - 1)),
         KeyCode::Char('f') if control => Some((selected + visible_height).min(link_count - 1)),
         KeyCode::Char('b') if control => Some(selected.saturating_sub(visible_height)),
-        KeyCode::Char('g') if !control && !alt => Some(0),
-        KeyCode::Char('G') if !control && !alt => Some(link_count - 1),
+        KeyCode::Char('g') if plain => Some(0),
+        KeyCode::Char('G') if plain => Some(link_count - 1),
         KeyCode::Home => Some(0),
         KeyCode::End => Some(link_count - 1),
         KeyCode::PageDown => Some((selected + visible_height).min(link_count - 1)),
@@ -5600,7 +5570,8 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
         ("y", "copy page text"),
         ("L", "link mode + browser"),
         ("s / a", "cycle / auto layout"),
-        ("b", "back from link"),
+        ("b / B", "back / forward from link"),
+        ("R", "reload configuration"),
         ("f", "open deck in new tab"),
         ("D", "duplicate tab at current view"),
         ("q", "leave mode / close tab"),
@@ -5673,7 +5644,7 @@ fn draw_help_menu(frame: &mut RatatuiFrame, theme: Palette) {
             Line::from(format!("Config: {path}")),
             Line::from("[viewer]: smooth_scroll, scroll_frame_ms, scroll_ease_divisor"),
             Line::from("[viewer]: continuous_scroll, prefetch_pages, set_window_title"),
-            Line::from("Commented defaults on first launch. Edit config, then restart."),
+            Line::from("Edit config, then press R to reload without restarting."),
         ])
         .style(Style::default().bg(colors.surface).fg(colors.text))
         .wrap(Wrap { trim: true }),
@@ -6688,7 +6659,10 @@ mod tests {
         )
         .expect("fresh links should update the retained picker");
         assert_eq!(app.tab().link_index.links[0].label, "Reloaded link");
-        assert_eq!(app.link_picker.as_ref().unwrap().selection_key, Some((0, 0)));
+        assert_eq!(
+            app.link_picker.as_ref().unwrap().selection_key,
+            Some((0, 0))
+        );
     }
 
     #[test]
@@ -8881,6 +8855,175 @@ mod tests {
         assert!(
             app.handle_modal_worker_message(crate::pptx::WorkerMessage::Error("boom".to_string()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn forward_history_resolves_a_bookmark_interrupted_before_rendering() {
+        let (mut app, viewport, _file) = continuous_app();
+        app.viewer.continuous_scroll = false;
+        app.tab_mut().scroll_y = 0;
+        let mut output = Vec::new();
+        // The disconnected worker leaves the uncached bookmark unresolved.
+        assert!(
+            app.follow_link(
+                crate::pptx::LinkTarget::Internal {
+                    page: 1,
+                    top_ratio: Some(0.75),
+                    left_ratio: None,
+                },
+                &mut output,
+            )
+            .is_err()
+        );
+        app.follow_link_back(&mut output).unwrap();
+        assert_eq!(app.tab().page, 0);
+        assert!(app.follow_link_forward(&mut output).is_err());
+        let key = app.render_key(viewport);
+        let frame = continuous_frame(key, app.tab().revision, false);
+        app.draw_frame(&frame, viewport, &mut output).unwrap();
+        assert_eq!(app.tab().page, 1);
+        assert_eq!(app.tab().scroll_y, 40);
+    }
+
+    #[test]
+    fn reload_preserves_active_bookmarks_without_restoring_canceled_ones() {
+        for canceled in [false, true] {
+            let (mut app, viewport, _file) = continuous_app();
+            app.viewer.continuous_scroll = false;
+            app.tab_mut().scroll_y = 0;
+            let mut output = Vec::new();
+            assert!(
+                app.follow_link(
+                    crate::pptx::LinkTarget::Internal {
+                        page: 1,
+                        top_ratio: Some(0.75),
+                        left_ratio: None,
+                    },
+                    &mut output,
+                )
+                .is_err()
+            );
+            if canceled {
+                assert!(app.set_page_vertically(1, &mut output).is_err());
+            }
+            let tab = app.tab();
+            let document_id = tab.document_id;
+            let revision = tab.revision;
+            app.session.pending_open = Some(super::session::PendingOpen::Reload {
+                document_id,
+                fingerprint: tab.watcher.accepted,
+            });
+            // The disconnected worker leaves the replacement render pending.
+            assert!(
+                app.finish_open(document_id, 1, Vec::new(), revision, &mut output)
+                    .is_err()
+            );
+            let frame = continuous_frame(app.render_key(viewport), revision, false);
+            app.draw_frame(&frame, viewport, &mut output).unwrap();
+            assert_eq!(app.tab().page, 0);
+            assert_eq!(app.tab().scroll_y, if canceled { 0 } else { 40 });
+            assert!(app.tab().pending_destination.is_none());
+        }
+    }
+
+    #[test]
+    fn tab_switch_replaces_outgoing_images_in_one_synchronized_frame() {
+        for continuous in [false, true] {
+            let (mut app, viewport, _file) = continuous_app();
+            app.viewer.continuous_scroll = continuous;
+            let outgoing: Vec<_> = app.visible_pages.iter().map(|page| page.image_id).collect();
+            let (mut other, _, _other_file) = continuous_app();
+            let mut tab = other.session.tabs.pop().unwrap();
+            tab.document_id += 1;
+            tab.page_count = 1;
+            tab.scroll_y = 0;
+            tab.cache.clear();
+            let key = tab.render_key(viewport, false, None);
+            tab.cache
+                .insert(key, continuous_frame(key, tab.revision, false));
+            app.session.tabs.push(tab);
+
+            let mut output = Vec::new();
+            app.select_tab(1, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains("\x1b_Ga=d,d=A,"));
+            let start = output.find("\x1b[?2026h").unwrap();
+            let end = output.find("\x1b[?2026l").unwrap();
+            for image_id in outgoing {
+                let deletion = output
+                    .find(&format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\"))
+                    .expect("outgoing image must be released");
+                assert!(start < deletion && deletion < end);
+            }
+            assert_eq!(app.submitted_key, Some(key));
+            assert_eq!(app.visible_page.as_ref().unwrap().frame.key, key);
+        }
+    }
+
+    #[test]
+    fn retained_outgoing_frames_are_not_clickable_in_another_document_or_view() {
+        let (mut app, viewport, _file) = continuous_app();
+        let mouse = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: viewport.top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.page_at_mouse(mouse, viewport).is_some());
+        app.tab_mut().document_id += 1;
+        assert!(app.page_at_mouse(mouse, viewport).is_none());
+        app.tab_mut().document_id -= 1;
+        app.tab_mut().zoom += 1;
+        assert!(app.page_at_mouse(mouse, viewport).is_none());
+    }
+
+    #[test]
+    fn modified_character_shortcuts_do_not_close_scroll_or_reconfigure_the_view() {
+        let (mut app, _, _file) = continuous_app();
+        let initial_scroll = app.tab().scroll_y;
+        let initial_geometry = app.link_picker_geometry;
+        let mut output = Vec::new();
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            for character in ['j', 'q', 'm', 'R'] {
+                assert!(
+                    !app.handle_key(
+                        KeyEvent::new(KeyCode::Char(character), modifier),
+                        &mut output
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        assert_eq!(app.tab().scroll_y, initial_scroll);
+        assert_eq!(app.smooth_scroll_remaining, 0);
+        app.link_picker = Some(super::LinkPickerState::new(0));
+        app.link_picker.as_mut().unwrap().focus = super::LinkPickerFocus::Document;
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            for character in ['j', 'q', 's', 'a', 'L'] {
+                assert!(
+                    !app.handle_key(
+                        KeyEvent::new(KeyCode::Char(character), modifier),
+                        &mut output
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        assert!(app.link_picker.is_some());
+        assert_eq!(app.tab().scroll_y, initial_scroll);
+        assert_eq!(app.link_picker_geometry.layout, initial_geometry.layout);
+        assert_eq!(
+            app.link_picker_geometry.split_percent,
+            initial_geometry.split_percent
         );
     }
 }

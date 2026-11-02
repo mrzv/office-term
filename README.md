@@ -54,6 +54,15 @@ oterm --session demo --screenshot page.png
 Relative screenshot paths resolve from the requesting command's working directory,
 not the viewer's. Existing destination files are never overwritten.
 
+Stop that session from another terminal:
+
+```sh
+oterm --session demo --quit
+```
+
+The quit command waits for acknowledgment and exits without opening a document or
+entering terminal mode. The viewer removes its socket during normal shutdown.
+
 ## Rendering and document fidelity
 
 - Saved spreadsheet formula results are preserved, including results from custom
@@ -68,6 +77,10 @@ not the viewer's. Existing destination files are never overwritten.
   objects parked completely outside the slide.
 - An open link browser refreshes after document reload. While editing its filter,
   `q` is ordinary query text; `Esc` still leaves the mode.
+- Opening, switching, and closing tabs keep the outgoing frame visible until its
+  replacement is ready, then replace it in one synchronized redraw.
+- Internal-link navigation has per-tab back/forward history, including scroll
+  position. Reloads retain that history and clamp destinations to the new page count.
 
 ## Configuration and stored state
 
@@ -75,6 +88,19 @@ Configuration lives at `$XDG_CONFIG_HOME/officeterm/config.toml`, or
 `~/.config/officeterm/config.toml` when `XDG_CONFIG_HOME` is unset. IPC socket
 length and private-directory requirements apply only when `--session` enables
 viewer control; ordinary viewing does not create the socket directory.
+
+Press `R` to reload the configuration and external themes in the running viewer.
+Invalid configuration, theme files, or an unavailable replacement socket leave the
+current settings and listener intact and show an error in the status bar. Changing
+the socket setting moves a named session's listener; viewers started without
+`--session` remain uncontrolled. After changing that setting, other commands must
+read the same configuration to find the session.
+
+Reloading preserves manually selected fit and dark modes unless their configured
+defaults changed. A CLI file-size override remains authoritative after reload;
+without one, the new configured limit applies to subsequent opens and reloads.
+Setting `theme = ""` restores the built-in palette even when an external theme
+catalog is configured.
 
 `max_file_size_mib = 256` limits document size on disk before reading the file.
 Set a positive integer MiB value in the configuration, or override it for one
@@ -120,7 +146,7 @@ metadata or recalculating saved results.
 | `Enter` | Browse slide links on the current slide (or open selected link/match) |
 | `L` | Toggle link mode and split link browser |
 | `s` / `a` | Cycle split layout / restore automatic split layout |
-| `b` | Jump back from a followed internal link |
+| `b` / `B` | Jump backward / forward through internal-link history |
 | `Click` | Follow slide link under the pointer |
 | `m` | Cycle fit mode (`fit-page`, `fit-width`, `fit-height`, `fit-content`) |
 | `+`, `=` / `-` | Zoom in / out |
@@ -128,6 +154,7 @@ metadata or recalculating saved results.
 | `i` | Toggle dark mode for slide rendering |
 | `S` | Toggle smooth scrolling |
 | `p` | Toggle performance timings in the status bar |
+| `R` | Reload configuration and external themes |
 | `t` | Open table of contents / slide outline picker |
 | `T` | Open color theme picker with live preview |
 | `y` | Open slide text viewer to select and copy text |
@@ -137,3 +164,8 @@ metadata or recalculating saved results.
 | `?` | Open keyboard and mouse shortcuts help menu |
 | `q` | Leave current mode or close active tab |
 | `Esc`, `Ctrl-c` | Leave current mode, clear search, or exit |
+
+Unexpected Ctrl/Alt/Super-modified character shortcuts are ignored rather than
+being treated as ordinary letters. `Ctrl-o` also navigates backward; `Ctrl-i`
+navigates forward when the terminal reports it distinctly from `Tab`. Use `B`
+for forward navigation in terminals where `Ctrl-i` is indistinguishable from `Tab`.

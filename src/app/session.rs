@@ -28,7 +28,7 @@ pub(super) struct Tab {
     pub(super) outline: Arc<Vec<OutlineItem>>,
     pub(super) cache: HashMap<RenderKey, Arc<Frame>>,
     pub(super) search: SearchState,
-    pub(super) link_history: Vec<ViewPosition>,
+    pub(super) link_history: history::JumpList,
     pub(super) pending_destination: Option<LinkDestination>,
     pub(super) link_index: LinkIndexState,
 }
@@ -222,8 +222,10 @@ impl App {
                 tab.outline = Arc::new(outline);
                 tab.cache.clear();
                 tab.search = SearchState::default();
-                tab.link_history.clear();
-                tab.pending_destination = None;
+                tab.link_history.clamp_pages(pages);
+                if let Some(destination) = &mut tab.pending_destination {
+                    destination.page = destination.page.min(pages.saturating_sub(1));
+                }
                 tab.link_index = LinkIndexState::new(pages);
                 if index == self.session.active_tab {
                     self.search_picker = None;
@@ -261,7 +263,7 @@ impl App {
                     outline: Arc::new(outline),
                     cache: HashMap::new(),
                     search: SearchState::default(),
-                    link_history: Vec::new(),
+                    link_history: history::JumpList::default(),
                     pending_destination: None,
                     link_index: LinkIndexState::new(pages),
                 });
@@ -276,7 +278,6 @@ impl App {
                     tab.center_content = view.position.center_content;
                 }
                 self.session.active_tab = self.session.tabs.len() - 1;
-                self.clear_viewer(output)?;
                 self.reset_render_state();
                 self.ensure_link_index();
                 self.request_current(output)?;
@@ -385,7 +386,6 @@ impl App {
             return Ok(());
         }
         self.session.active_tab = index;
-        self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
         self.request_current(output)
@@ -403,7 +403,6 @@ impl App {
         if self.session.active_tab == self.session.tabs.len() {
             self.session.active_tab -= 1;
         }
-        self.clear_viewer(output)?;
         self.reset_render_state();
         self.ensure_link_index();
         self.request_current(output)?;

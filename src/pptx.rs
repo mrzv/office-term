@@ -317,6 +317,7 @@ enum WorkerCommand {
         document_id: DocumentId,
         request_id: u64,
     },
+    SetMaxFileSize(u32),
     Shutdown,
 }
 
@@ -481,6 +482,13 @@ impl PptxWorker {
             .map_err(|_| "presentation worker stopped".into())
     }
 
+    /// Apply the live size limit to subsequent document opens and reloads.
+    pub(crate) fn set_max_file_size_mib(&self, limit: u32) -> Result<(), String> {
+        self.commands
+            .send(WorkerCommand::SetMaxFileSize(limit))
+            .map_err(|_| "presentation worker stopped".into())
+    }
+
     pub fn close(&self, document_id: DocumentId) {
         let _ = self.commands.send(WorkerCommand::Close { document_id });
     }
@@ -613,6 +621,7 @@ struct PendingCommands {
     text_requests: VecDeque<(DocumentId, u32)>,
     searches: VecDeque<(DocumentId, u64, String)>,
     link_indices: VecDeque<(DocumentId, u64)>,
+    max_file_size_mib: Option<u32>,
     shutdown: bool,
 }
 
@@ -626,6 +635,7 @@ impl PendingCommands {
             text_requests: VecDeque::new(),
             searches: VecDeque::new(),
             link_indices: VecDeque::new(),
+            max_file_size_mib: None,
             shutdown: false,
         }
     }
@@ -697,6 +707,9 @@ impl PendingCommands {
                     .retain(|(queued_id, _)| *queued_id != document_id);
                 self.link_indices.push_back((document_id, request_id));
             }
+            WorkerCommand::SetMaxFileSize(limit) => {
+                self.max_file_size_mib = Some(limit);
+            }
             WorkerCommand::Shutdown => {
                 self.shutdown = true;
             }
@@ -720,6 +733,7 @@ impl PendingCommands {
             && self.text_requests.is_empty()
             && self.searches.is_empty()
             && self.link_indices.is_empty()
+            && self.max_file_size_mib.is_none()
             && !self.shutdown
     }
 }
@@ -788,7 +802,10 @@ fn register_presentation_fonts(files: Vec<(String, Vec<u8>)>) -> FontAliases {
                 ""
             };
             let separator = if symbol.is_empty() { "" } else { "-" };
-            format!("{symbol}{separator}office-term-pptx-{}-font-{next}", fonts.len())
+            format!(
+                "{symbol}{separator}office-term-pptx-{}-font-{next}",
+                fonts.len()
+            )
         });
     }
     // Register only private aliases: the original family must not leak into another deck.
@@ -873,7 +890,11 @@ fn remap_presentation_fonts(presentation: &mut Presentation, aliases: &FontAlias
                 font(&mut script.typeface, aliases);
             }
         }
-        for style in [&mut item.title_style, &mut item.body_style, &mut item.other_style] {
+        for style in [
+            &mut item.title_style,
+            &mut item.body_style,
+            &mut item.other_style,
+        ] {
             list(style, aliases);
         }
         shapes(&mut item.shapes, aliases);
@@ -890,9 +911,12 @@ fn remap_presentation_fonts(presentation: &mut Presentation, aliases: &FontAlias
     for item in &mut presentation.masters {
         master(Arc::make_mut(item), aliases);
     }
-    for item in [&mut presentation.notes_master, &mut presentation.handout_master]
-        .into_iter()
-        .flatten()
+    for item in [
+        &mut presentation.notes_master,
+        &mut presentation.handout_master,
+    ]
+    .into_iter()
+    .flatten()
     {
         master(Arc::make_mut(item), aliases);
     }
@@ -1059,7 +1083,7 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 fn worker_loop(
     path: PathBuf,
-    max_file_size_mib: u32,
+    mut max_file_size_mib: u32,
     commands: Receiver<WorkerCommand>,
     messages: Sender<WorkerMessage>,
     latest_generation: Arc<AtomicU64>,
@@ -1099,6 +1123,9 @@ fn worker_loop(
         pending.drain(&commands);
         if pending.shutdown {
             break;
+        }
+        if let Some(limit) = pending.max_file_size_mib.take() {
+            max_file_size_mib = limit;
         }
 
         while let Some(document_id) = pending.closes.pop_front() {
@@ -2540,10 +2567,13 @@ mod tests {
                     paragraphs: vec![
                         Paragraph::new("AAAA"),
                         Paragraph {
-                            runs: vec![Run::with("BBBB", deckcraft_model::text::RunProps {
-                                font: Some("Ubuntu".into()),
-                                ..Default::default()
-                            })],
+                            runs: vec![Run::with(
+                                "BBBB",
+                                deckcraft_model::text::RunProps {
+                                    font: Some("Ubuntu".into()),
+                                    ..Default::default()
+                                },
+                            )],
                             ..Default::default()
                         },
                     ],
@@ -2578,11 +2608,18 @@ mod tests {
                 assert_eq!(run.face.data(), second.as_slice());
             }
             assert_ne!(face_one.family, face_two.family);
-            assert_eq!(place_slide(&one, 0).texts[0].layout.runs[0].face.data(), first);
-            let reopened = load_presentation_from_bytes(Path::new("one.pptx"), &first_bytes).unwrap();
+            assert_eq!(
+                place_slide(&one, 0).texts[0].layout.runs[0].face.data(),
+                first
+            );
+            let reopened =
+                load_presentation_from_bytes(Path::new("one.pptx"), &first_bytes).unwrap();
             let reopened = place_slide(&reopened, 0);
             assert_eq!(reopened.texts[0].layout.runs[0].face.id(), face_one.id());
-            assert_eq!(FontDb::global().face("Ubuntu", "Regular").id(), original.id());
+            assert_eq!(
+                FontDb::global().face("Ubuntu", "Regular").id(),
+                original.id()
+            );
         }
     }
 
@@ -2594,9 +2631,11 @@ mod tests {
         let mut mappings: Vec<(u32, u32)> = (32..127)
             .map(|c| (c, face.glyph_for(char::from_u32(c).unwrap())))
             .collect();
-        mappings.extend("▪➢✓❖❑■●◆•–►◄▲▼➔▶✕◀★○".chars().map(|c| {
-            (c as u32, face.glyph_for('A'))
-        }));
+        mappings.extend(
+            "▪➢✓❖❑■●◆•–►◄▲▼➔▶✕◀★○"
+                .chars()
+                .map(|c| (c as u32, face.glyph_for('A'))),
+        );
         if include_pua {
             mappings.extend((0xF000..=0xF0FF).map(|c| (c, face.glyph_for('B'))));
         }
@@ -2648,7 +2687,9 @@ mod tests {
                 let baseline_symbol = deckcraft_text::symbol_char(&baseline_face, family, code);
                 let expected_char = baseline_symbol.unwrap_or_else(|| {
                     deckcraft_text::map_symbol_bullet(&code.to_string(), Some(family))
-                        .chars().next().unwrap()
+                        .chars()
+                        .next()
+                        .unwrap()
                 });
                 let pua_char = char::from_u32(0xF000 | code as u32).unwrap();
                 let expected_glyph = baseline_face.glyph_for(expected_char);
@@ -2657,13 +2698,17 @@ mod tests {
                     assert_eq!(expected_char, pua_char);
                 }
                 let mut pres = Presentation::default();
-                let media = pres.add_media("symbols.ttf", "application/x-font-ttf", bytes.clone()).unwrap();
+                let media = pres
+                    .add_media("symbols.ttf", "application/x-font-ttf", bytes.clone())
+                    .unwrap();
                 pres.embedded_fonts.push(deckcraft_model::EmbeddedFont {
                     typeface: family.into(),
                     regular: Some(media),
                     ..Default::default()
                 });
-                let marker = Bullet::Char { char: code.to_string() };
+                let marker = Bullet::Char {
+                    char: code.to_string(),
+                };
                 let mut inherited = Paragraph::new("A");
                 inherited.props.bullet = Some(marker.clone());
                 let mut explicit = Paragraph::new("A");
@@ -2676,27 +2721,36 @@ mod tests {
                     ..Default::default()
                 };
                 // Font-only inheritance and a complete list-level bullet both survive remapping.
-                pres.default_text_style.set(0, LevelStyle {
-                    para: deckcraft_model::text::ParaProps {
-                        bullet_font: Some(family.into()),
+                pres.default_text_style.set(
+                    0,
+                    LevelStyle {
+                        para: deckcraft_model::text::ParaProps {
+                            bullet_font: Some(family.into()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                });
-                body.list_style.set(1, LevelStyle {
-                    para: deckcraft_model::text::ParaProps {
-                        bullet: Some(marker),
-                        bullet_font: Some(family.into()),
+                );
+                body.list_style.set(
+                    1,
+                    LevelStyle {
+                        para: deckcraft_model::text::ParaProps {
+                            bullet: Some(marker),
+                            bullet_font: Some(family.into()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                });
+                );
                 if include_pua {
                     body.paragraphs.push(Paragraph {
-                        runs: vec![Run::with(pua_char.to_string(), RunProps {
-                            font_sym: Some(family.into()),
-                            ..Default::default()
-                        })],
+                        runs: vec![Run::with(
+                            pua_char.to_string(),
+                            RunProps {
+                                font_sym: Some(family.into()),
+                                ..Default::default()
+                            },
+                        )],
                         ..Default::default()
                     });
                 }
@@ -2709,8 +2763,10 @@ mod tests {
                     ..Default::default()
                 }];
                 let pres = load_presentation_from_bytes(
-                    Path::new("symbols.pptx"), &deckcraft_pptx::export(&pres).unwrap(),
-                ).unwrap();
+                    Path::new("symbols.pptx"),
+                    &deckcraft_pptx::export(&pres).unwrap(),
+                )
+                .unwrap();
                 let placed = place_slide(&pres, 0);
                 let runs = &placed.texts[0].layout.runs;
                 let bullets: Vec<_> = runs.iter().filter(|r| r.cells.is_empty()).collect();
@@ -2725,9 +2781,16 @@ mod tests {
                     );
                 }
                 if include_pua {
-                    let symbol = runs.iter().find(|r| r.para == 3 && !r.cells.is_empty()).unwrap();
+                    let symbol = runs
+                        .iter()
+                        .find(|r| r.para == 3 && !r.cells.is_empty())
+                        .unwrap();
                     assert_eq!(symbol.face.data(), bytes, "{family}");
-                    assert_eq!(symbol.glyphs[0].0, baseline_face.glyph_for(pua_char), "{family}");
+                    assert_eq!(
+                        symbol.glyphs[0].0,
+                        baseline_face.glyph_for(pua_char),
+                        "{family}"
+                    );
                 }
             }
         }
@@ -2768,7 +2831,9 @@ mod tests {
         let prefix = "Prefix ";
         let linked_text = "one two three four five six seven eight nine ten";
         for action in [
-            Action::Url { url: " https://example.com ".into() },
+            Action::Url {
+                url: " https://example.com ".into(),
+            },
             Action::NextSlide,
         ] {
             for rotated in [false, true] {
@@ -2799,10 +2864,13 @@ mod tests {
                             },
                             runs: vec![
                                 Run::new(prefix),
-                                Run::with(linked_text, RunProps {
-                                    link: Some(linked),
-                                    ..Default::default()
-                                }),
+                                Run::with(
+                                    linked_text,
+                                    RunProps {
+                                        link: Some(linked),
+                                        ..Default::default()
+                                    },
+                                ),
                             ],
                             ..Default::default()
                         }],
@@ -2828,7 +2896,10 @@ mod tests {
                     }],
                     ..Default::default()
                 }));
-                pres.slides.push(Arc::new(Slide { id: SlideId(4), ..Default::default() }));
+                pres.slides.push(Arc::new(Slide {
+                    id: SlideId(4),
+                    ..Default::default()
+                }));
                 let placed = place_slide(&pres, 0);
                 let pt = &placed.texts[0];
                 let links = extract_slide_links(&pres, 0, &placed, 1000, 1000, 1.0);
@@ -2842,7 +2913,11 @@ mod tests {
                     assert_eq!(link.label, linked_text);
                     let target = match &action {
                         Action::Url { .. } => LinkTarget::Uri("https://example.com".into()),
-                        _ => LinkTarget::Internal { page: 1, top_ratio: None, left_ratio: None },
+                        _ => LinkTarget::Internal {
+                            page: 1,
+                            top_ratio: None,
+                            left_ratio: None,
+                        },
                     };
                     assert_eq!(link.target, target);
                     assert!(
@@ -2853,14 +2928,28 @@ mod tests {
                         "the unlinked prefix must not be clickable: {link:?}",
                     );
                 }
-                let expected: Vec<_> = pt.layout.lines.iter().filter_map(|line| {
-                    let (x0, x1) = line.span(prefix_len, prefix_len + linked_text.chars().count())?;
-                    bbox_to_page_link_rect(
-                        transform_rect_bbox(&pt.transform, KurboRect::new(x0, line.top, x1, line.bottom)),
-                        1000, 1000, 1.0,
-                    )
-                }).collect();
-                assert_eq!(links.iter().map(|link| link.rect).collect::<Vec<_>>(), expected);
+                let expected: Vec<_> = pt
+                    .layout
+                    .lines
+                    .iter()
+                    .filter_map(|line| {
+                        let (x0, x1) =
+                            line.span(prefix_len, prefix_len + linked_text.chars().count())?;
+                        bbox_to_page_link_rect(
+                            transform_rect_bbox(
+                                &pt.transform,
+                                KurboRect::new(x0, line.top, x1, line.bottom),
+                            ),
+                            1000,
+                            1000,
+                            1.0,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    links.iter().map(|link| link.rect).collect::<Vec<_>>(),
+                    expected
+                );
             }
         }
     }
@@ -3153,6 +3242,28 @@ mod tests {
                 ..
             }
         ));
+        worker.set_max_file_size_mib(2).unwrap();
+        worker.open(4, oversized.clone()).unwrap();
+        assert!(matches!(
+            worker.messages.recv().unwrap(),
+            WorkerMessage::Opened {
+                document_id: 4,
+                pages: 1,
+                ..
+            }
+        ));
+        worker.set_max_file_size_mib(1).unwrap();
+        worker.open(5, oversized.clone()).unwrap();
+        assert!(matches!(
+            worker.messages.recv().unwrap(),
+            WorkerMessage::OpenError { document_id: 5, .. }
+        ));
+        // Lowering the limit affects future opens, not already usable documents.
+        worker.extract_text(4, 0).unwrap();
+        match worker.messages.recv().unwrap() {
+            WorkerMessage::Text { content, .. } => assert!(content.contains("Hello")),
+            other => panic!("unexpected message: {other:?}"),
+        }
 
         let (larger_limit, pages, _, _) = PptxWorker::spawn(oversized, 2).unwrap();
         assert_eq!(pages, 1);

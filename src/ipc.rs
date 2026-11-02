@@ -205,6 +205,26 @@ struct ReplyBody<'a> {
 #[derive(Debug)]
 pub enum ViewerRequest {
     Screenshot(PathBuf),
+    Quit,
+}
+
+fn parse_viewer_request(payload: &str) -> io::Result<ViewerRequest> {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+    enum Request {
+        Screenshot { path: PathBuf },
+        Quit {},
+    }
+
+    let request = serde_json::from_str(payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    match request {
+        Request::Screenshot { path } => {
+            validate_screenshot_path(&path)?;
+            Ok(ViewerRequest::Screenshot(path))
+        }
+        Request::Quit {} => Ok(ViewerRequest::Quit),
+    }
 }
 
 pub(crate) const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -347,6 +367,11 @@ pub fn screenshot(socket: &str, path: &Path) -> io::Result<()> {
     )
 }
 
+pub fn quit(socket: &str) -> io::Result<()> {
+    let operation = crate::process::Operation::new(FORWARD_TIMEOUT + Duration::from_secs(1));
+    request_reply(socket, br#"{"type":"quit"}"#, "quit", &operation)
+}
+
 /// Incremental request reads. A slow client never sleeps on the event thread.
 struct Incoming {
     stream: UnixStream,
@@ -437,29 +462,7 @@ impl ForwardListener {
         while index < self.clients.len() {
             if let Some(result) = self.clients[index].poll() {
                 let client = self.clients.remove(index);
-                let request = result.and_then(|payload| {
-                    let value: serde_json::Value = serde_json::from_str(&payload)?;
-                    match value.get("type").and_then(serde_json::Value::as_str) {
-                        Some("screenshot") => {
-                            let path = value
-                                .get("path")
-                                .and_then(serde_json::Value::as_str)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "screenshot request has no path",
-                                    )
-                                })?;
-                            let path = PathBuf::from(path);
-                            validate_screenshot_path(&path)?;
-                            Ok(ViewerRequest::Screenshot(path))
-                        }
-                        _ => Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unsupported viewer request type",
-                        )),
-                    }
-                });
+                let request = result.and_then(|payload| parse_viewer_request(&payload));
                 ready.push((request, ForwardReply::new(client.stream)));
             } else {
                 index += 1;
@@ -473,6 +476,97 @@ impl ForwardListener {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn viewer_requests_reject_unknown_types_fields_and_malformed_payloads() {
+        for payload in [
+            r#"{}"#,
+            r#"{"type":"unknown"}"#,
+            r#"{"type":"quit","extra":true}"#,
+            r#"{"type":"quit","path":null}"#,
+            r#"{"type":"quit","type":"quit"}"#,
+            r#"{"type":"screenshot"}"#,
+            r#"{"type":"screenshot","path":12}"#,
+            r#"{"type":"screenshot","path":"/capture.png","extra":true}"#,
+            r#"{"type":"quit"} {}"#,
+            r#"{"type":"quit""#,
+            r#"[]"#,
+        ] {
+            assert_eq!(
+                parse_viewer_request(payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{payload}"
+            );
+        }
+        assert!(matches!(
+            parse_viewer_request(r#"{"type":"quit"}"#).unwrap(),
+            ViewerRequest::Quit
+        ));
+    }
+
+    #[test]
+    fn screenshot_requests_keep_output_path_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("capture.png");
+        let payload = serde_json::json!({"type": "screenshot", "path": path}).to_string();
+        assert!(matches!(
+            parse_viewer_request(&payload).unwrap(),
+            ViewerRequest::Screenshot(output) if output == path
+        ));
+        fs::write(&path, b"existing").unwrap();
+        assert_eq!(
+            parse_viewer_request(&payload).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            parse_viewer_request(r#"{"type":"screenshot","path":"relative.png"}"#)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn quit_request_replies_success_before_listener_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private/quit.sock");
+        let mut listener = ForwardListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(br#"{"type":"quit"}"#).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (request, mut reply) = listener.poll().unwrap().into_iter().next().unwrap();
+        assert!(matches!(request.unwrap(), ViewerRequest::Quit));
+        reply.finish(None);
+        drop(reply);
+        drop(listener);
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        let response: Reply = serde_json::from_str(&payload).unwrap();
+        assert!(response.ok);
+        assert!(response.error.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn quit_client_uses_request_reply_protocol() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private/quit.sock");
+        let listener = Listener::bind(&path).unwrap();
+        listener.socket.set_nonblocking(false).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.socket.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut payload = String::new();
+            stream.read_to_string(&mut payload).unwrap();
+            assert_eq!(payload, r#"{"type":"quit"}"#);
+            ForwardReply::new(stream).finish(None);
+        });
+        quit(path.to_str().unwrap()).unwrap();
+        server.join().unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn forward_reply_waits_for_submission_and_survives_request_half_close() {

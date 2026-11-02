@@ -201,6 +201,65 @@ pub fn available_themes(
     discover_themes(catalog_path, selected_path, &home_dir())
 }
 
+pub(crate) struct LoadedThemes {
+    pub choices: Vec<(String, Palette)>,
+    pub selected: Palette,
+}
+
+/// Load every configured palette before a live reload changes any viewer state.
+pub(crate) fn load_for_reload(
+    catalog_path: Option<&str>,
+    selected_path: Option<&str>,
+) -> Result<LoadedThemes, Box<dyn std::error::Error>> {
+    let home = home_dir();
+    let mut themes = Vec::new();
+    if let Some(catalog_path) = catalog_path {
+        let path = expand_home(&home, catalog_path);
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| format!("could not read theme catalog {}: {error}", path.display()))?;
+        let catalog: toml::Value = toml::from_str(&contents).map_err(|error| {
+            format!("could not parse theme catalog {}: {error}", path.display())
+        })?;
+        let paths = catalog
+            .get("themes")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "theme catalog {} must contain a themes array",
+                    path.display()
+                )
+            })?;
+        for entry in paths {
+            let configured_path = entry.as_str().ok_or_else(|| {
+                format!(
+                    "theme catalog {} contains a non-string theme path",
+                    path.display()
+                )
+            })?;
+            let path = expand_home(&home, configured_path);
+            let theme = load_theme_file(&path)?;
+            let name = theme_name(&path);
+            themes.retain(|(existing, _)| existing != &name);
+            themes.push((name, theme));
+        }
+    }
+    let selected = if let Some(selected_path) = selected_path {
+        let path = expand_home(&home, selected_path);
+        let theme = load_theme_file(&path)?;
+        let name = theme_name(&path);
+        themes.retain(|(existing, _)| existing != &name);
+        themes.push((name, theme));
+        theme
+    } else {
+        TOKYO_NIGHT_MOON
+    };
+    themes.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(LoadedThemes {
+        choices: themes,
+        selected,
+    })
+}
+
 pub fn load(configured_path: &str) -> Result<Palette, ThemeError> {
     let path = expand_home(&home_dir(), configured_path);
     load_theme_file(&path)
@@ -242,7 +301,7 @@ fn load_catalog_paths(catalog_path: &Path) -> Vec<String> {
     let Ok(contents) = fs::read_to_string(catalog_path) else {
         return Vec::new();
     };
-    let Ok(catalog) = contents.parse::<toml::Value>() else {
+    let Ok(catalog) = toml::from_str::<toml::Value>(&contents) else {
         return Vec::new();
     };
     catalog
@@ -802,15 +861,46 @@ cursor_bg = "surface0"
         )
         .unwrap();
 
-        let themes = discover_themes(
-            Some(catalog.to_str().unwrap()),
-            Some(themes_dir.join("synthetic-theme.toml").to_str().unwrap()),
-            root.path(),
-        );
+        let themes = discover_themes(Some(catalog.to_str().unwrap()), None, root.path());
 
         assert_eq!(themes.len(), 1);
         assert_eq!(themes[0].0, "synthetic theme");
         assert_eq!(themes[0].1.bg, rgb(0x10, 0x10, 0x10));
+    }
+
+    #[test]
+    fn reload_rejects_invalid_selected_theme_instead_of_falling_back() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.toml");
+        std::fs::write(&path, "not a palette").unwrap();
+        assert!(super::load_for_reload(None, path.to_str()).is_err());
+    }
+
+    #[test]
+    fn reload_rejects_broken_catalog_or_catalog_palette() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = root.path().join("catalog.toml");
+        for contents in ["[", "themes = 1", "themes = [42]"] {
+            std::fs::write(&catalog, contents).unwrap();
+            assert!(super::load_for_reload(catalog.to_str(), None).is_err());
+        }
+        let missing = root.path().join("missing.toml");
+        std::fs::write(
+            &catalog,
+            format!("themes = [{:?}]", missing.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(super::load_for_reload(catalog.to_str(), None).is_err());
+        std::fs::write(&missing, "invalid palette").unwrap();
+        assert!(super::load_for_reload(catalog.to_str(), None).is_err());
+        std::fs::write(
+            &missing,
+            TOKYO_NIGHT_MOON_TOML.replace("#222436", "#101010"),
+        )
+        .unwrap();
+        let loaded = super::load_for_reload(catalog.to_str(), None).unwrap();
+        assert_eq!(loaded.choices[0].0, "missing");
+        assert_eq!(loaded.choices[0].1.bg, rgb(0x10, 0x10, 0x10));
     }
 
     #[test]

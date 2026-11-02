@@ -28,6 +28,10 @@ struct Cli {
     /// Save the running viewer's visible document viewport as a PNG.
     #[arg(long, requires = "session", conflicts_with = "path")]
     screenshot: Option<PathBuf>,
+
+    /// Stop a running named viewer session.
+    #[arg(long, requires = "session", conflicts_with_all = ["path", "screenshot", "print_config", "page", "max_file_size_mib"])]
+    quit: bool,
 }
 
 fn main() -> ExitCode {
@@ -39,9 +43,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(limit) = cli.max_file_size_mib {
-        config.max_file_size_mib = limit;
-    }
+    config.set_max_file_size_override(cli.max_file_size_mib);
     if let Err(error) = config.select_session(cli.session.as_deref()) {
         eprintln!("oterm: {error}");
         return ExitCode::FAILURE;
@@ -57,6 +59,19 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+    if cli.quit {
+        let result = config
+            .forward_socket()
+            .ok_or_else(|| std::io::Error::other("forward_socket is disabled"))
+            .and_then(officeterm::ipc::quit);
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("oterm: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if let Some(path) = cli.screenshot.as_deref() {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -83,6 +98,42 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("oterm: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn quit_requires_a_named_session() {
+        assert_eq!(
+            Cli::try_parse_from(["oterm", "--quit"]).unwrap_err().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        let cli = Cli::try_parse_from(["oterm", "--session", "demo", "--quit"]).unwrap();
+        assert!(cli.quit);
+        assert_eq!(cli.session.as_deref(), Some("demo"));
+        assert!(cli.path.is_none());
+    }
+
+    #[test]
+    fn quit_rejects_document_and_other_actions() {
+        for incompatible in [
+            vec!["document.pdf"],
+            vec!["--screenshot", "capture.png"],
+            vec!["--print-config"],
+            vec!["--page", "2"],
+            vec!["--max-file-size-mib", "100"],
+        ] {
+            let mut args = vec!["oterm", "--session", "demo", "--quit"];
+            args.extend(incompatible);
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
 # officeterm configuration. Created on first launch; existing files are never overwritten.
 # Default location: ~/.config/officeterm/config.toml.
-# XDG_CONFIG_HOME overrides ~/.config. Restart viewer after editing.
+# XDG_CONFIG_HOME overrides ~/.config. Press R to reload configuration and themes.
 
 fit_mode = "page"                  # page, width, height, or content
 max_file_size_mib = 256             # Maximum document size on disk; positive MiB, CLI --max-file-size-mib overrides
