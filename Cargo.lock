@@ -591,7 +591,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-anim"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-geom",
  "deckcraft-model",
@@ -601,7 +601,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-color"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "serde",
 ]
@@ -621,7 +621,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-format"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-model",
  "serde",
@@ -633,7 +633,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-geom"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "kurbo",
  "serde",
@@ -651,7 +651,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-model"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-color",
  "deckcraft-geom",
@@ -664,7 +664,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-pptx"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-color",
  "deckcraft-geom",
@@ -678,7 +678,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-render"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "deckcraft-anim",
  "deckcraft-color",
@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-text"
 version = "0.9.0"
-source = "git+https://github.com/storytold/deckcraft#354087ecd56305842582e9e410cf24d595849789"
+source = "git+https://github.com/storytold/deckcraft?rev=354087ecd56305842582e9e410cf24d595849789#354087ecd56305842582e9e410cf24d595849789"
 dependencies = [
  "chrono",
  "deckcraft-color",
@@ -978,7 +978,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-chart"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-calc",
  "gridcraft-core",
@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-core"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "js-sys",
  "serde",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-engine"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-calc",
  "gridcraft-chart",
@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-formula"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-core",
  "serde",
@@ -1031,7 +1031,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-functions"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-core",
  "regex",
@@ -1040,7 +1040,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-model"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-core",
  "gridcraft-formula",
@@ -1052,7 +1052,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-numfmt"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 dependencies = [
  "gridcraft-core",
 ]
@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "gridcraft-pdf"
 version = "0.10.0"
-source = "git+https://github.com/storytold/gridcraft#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
+source = "git+https://github.com/storytold/gridcraft?rev=8ae67c5534f3d7f145423a57206cf5fd08fe9221#8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 
 [[package]]
 name = "gridcraft-xlsx"
@@ -2618,7 +2618,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-docbin"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "cfb",
  "image",
@@ -2633,7 +2633,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-docx"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2655,7 +2655,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-fonts"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "harfrust",
  "kurbo",
@@ -2669,7 +2669,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-formats"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "cfb",
  "chardetng",
@@ -2686,7 +2686,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-geom"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "serde",
 ]
@@ -2694,7 +2694,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-layout"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "image",
  "js-sys",
@@ -2714,7 +2714,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-metafile"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "kurbo",
  "thiserror",
@@ -2723,7 +2723,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-proof"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "log",
  "miniz_oxide 0.8.9",
@@ -2732,7 +2732,7 @@ dependencies = [
 [[package]]
 name = "wordcraft-render"
 version = "0.9.0"
-source = "git+https://github.com/storytold/wordcraft#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
+source = "git+https://github.com/storytold/wordcraft?rev=ff3c7d8d25bd8271326f372cb90f2c8106ec4d92#ff3c7d8d25bd8271326f372cb90f2c8106ec4d92"
 dependencies = [
  "image",
  "log",

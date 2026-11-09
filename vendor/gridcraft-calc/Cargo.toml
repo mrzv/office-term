@@ -11,11 +11,11 @@ repository = "https://github.com/storytold/gridcraft"
 revision = "8ae67c5534f3d7f145423a57206cf5fd08fe9221"
 
 [dependencies]
-gridcraft-core = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-formula = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-functions = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-numfmt = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-model = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-core = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-formula = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-functions = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-numfmt = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
 log = "0.4"
 
 [lints.rust]

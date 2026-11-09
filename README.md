@@ -17,6 +17,16 @@ Minimal terminal Office document viewer built on the ArtCraft collection (`deckc
 cargo run --release -- path/to/document.docx
 ```
 
+Install from this checkout using locked dependency versions:
+
+```sh
+cargo install --locked --path .
+```
+
+Git dependencies on DeckCraft, GridCraft, and WordCraft use explicit revision pins
+to match the vendored patches. `--locked` also preserves registry dependency
+versions during installation.
+
 Run the application and vendored-library regression suites:
 
 ```sh

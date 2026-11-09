@@ -20,15 +20,15 @@ base64 = "0.23.0"
 clap = { version = "4.6.5", features = ["derive"] }
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.15"
-deckcraft-fonts = { git = "https://github.com/storytold/deckcraft" }
-deckcraft-format = { git = "https://github.com/storytold/deckcraft" }
-deckcraft-model = { git = "https://github.com/storytold/deckcraft" }
-deckcraft-pptx = { git = "https://github.com/storytold/deckcraft" }
-deckcraft-render = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-fonts = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
+deckcraft-format = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
+deckcraft-model = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
+deckcraft-pptx = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
+deckcraft-render = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
 flate2 = "1.1.9"
-gridcraft-chart = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-engine = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-chart = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-engine = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kurbo = "0.13"
 libc = "0.2"
@@ -41,17 +41,17 @@ thiserror = "2.0.17"
 toml = "1.1.6"
 unicode-normalization = "0.1.24"
 vello_cpu = "0.2"
-wordcraft-doc = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-docbin = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-docx = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-fonts = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-formats = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-geom = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-layout = { git = "https://github.com/storytold/wordcraft" }
-wordcraft-render = { git = "https://github.com/storytold/wordcraft" }
+wordcraft-doc = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-docbin = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-docx = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-fonts = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-formats = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-geom = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-layout = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
+wordcraft-render = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92" }
 
 [dev-dependencies]
-deckcraft-text = { git = "https://github.com/storytold/deckcraft" }
+deckcraft-text = { git = "https://github.com/storytold/deckcraft", rev = "354087ecd56305842582e9e410cf24d595849789" }
 tempfile = "3.27.0"
 
 [patch."https://github.com/storytold/wordcraft"]

@@ -20,7 +20,7 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 
 [dependencies]
-wordcraft-geom = { git = "https://github.com/storytold/wordcraft", version = "0.9.0" }
+wordcraft-geom = { git = "https://github.com/storytold/wordcraft", rev = "ff3c7d8d25bd8271326f372cb90f2c8106ec4d92", version = "0.9.0" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"

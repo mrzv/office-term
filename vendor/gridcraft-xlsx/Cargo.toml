@@ -17,9 +17,9 @@ unsafe_code = "forbid"
 test-support = []
 
 [dependencies]
-gridcraft-core = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-formula = { git = "https://github.com/storytold/gridcraft" }
-gridcraft-model = { git = "https://github.com/storytold/gridcraft" }
+gridcraft-core = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-formula = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "8ae67c5534f3d7f145423a57206cf5fd08fe9221" }
 thiserror = "2"
 quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
