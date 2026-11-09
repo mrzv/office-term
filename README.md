@@ -83,8 +83,9 @@ entering terminal mode. The viewer removes its socket during normal shutdown.
   icons remain visible when the rule hides the cell's numeric value.
 - Embedded PowerPoint and Word font subsets are isolated between documents.
   Wrapped hyperlinks are clickable only on their linked text segments.
-- PowerPoint EMF+ figures render even when marked dual-format but missing a drawable
-  EMF fallback. Existing drawable EMF fallbacks remain preferred.
+- PowerPoint EMF+ figures use EMF+ playback in both Only and Dual formats, including
+  dual files without a drawable EMF fallback. Ordinary EMF records in EMF+ files
+  play only within `EmfPlusGetDC` windows.
 - Fit-content includes Word freeform drawings and ink, and ignores PowerPoint
   objects parked completely outside the slide.
 - An open link browser refreshes after document reload. While editing its filter,
@@ -137,7 +138,10 @@ fonts, numbering restarts, legacy-form XML text, equation breaks, locale-aware
 collation, and rotated connector rerouting. The vendored `deckcraft-fonts` and
 `deckcraft-metafile` crates are pinned to `354087ecd56305842582e9e410cf24d595849789`.
 Local patches add document-local font-family registration without changing embedded
-font bytes, and replay EMF+ when a dual-format metafile has no drawable EMF fallback.
+font bytes, and honor `EmfPlusGetDC` playback boundaries in both Only and Dual
+metafiles. The playback changes backport
+[DeckCraft PR #1464](https://github.com/storytold/deckcraft/pull/1464) at
+`db26c2b83a08d920063cf4b88060fa84ec0fca9f`, with an additional EMF+ Only gating fix.
 The `gridcraft-xlsx` importer and `gridcraft-calc` engine are pinned to
 `8ae67c5534f3d7f145423a57206cf5fd08fe9221`. The importer preserves saved array
 and spill results, releasing their cached followers only when an anchor needs

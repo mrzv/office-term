@@ -38,51 +38,42 @@ pub(crate) fn parse(input: Bytes) -> Result<(Canvas, Option<Frame>), Error> {
     let bounds = rect32(input, 8).ok_or(Error::BadHeader)?;
     let [l, t, r, b] = bounds;
     let frame = frame_from_header(input).or_else(|| (r > l && b > t).then_some(Frame { rect: [l, t, r - l, b - t], size: None }));
-    let mut allow_dual = false;
-    loop {
-        let mut cv = Canvas::new();
-        if r > l && b > t {
-            cv.set_clip_surface([l, t, r, b]);
-        }
-        if let Some(px_mm) = device_px_per_mm(input) {
-            cv.set_device_mm(px_mm);
-        }
-        let mut plus = crate::emfplus::Plus::new(allow_dual);
-        plus.frame = frame.as_ref().map(|f| f.rect);
-        let mut parsed = 0usize;
-        let mut pos = hsize.max(88);
-        while !cv.full() {
-            let (Some(typ), Some(size)) = (input.u32(pos), pos.checked_add(4).and_then(|o| input.u32(o))) else { break };
-            let size = size as usize;
-            if size < 8 || !size.is_multiple_of(4) {
-                break;
-            }
-            let Some(rec) = input.slice(pos, size) else { break };
-            if typ == 14 {
-                break;
-            }
-            if typ == 70 && Bytes(rec).u32(12) == Some(crate::emfplus::EMF_PLUS) {
-                if let Some(data) = Bytes(rec).tail(16) {
-                    plus.comment(&mut cv, data);
-                }
-            } else {
-                record(&mut cv, typ, Bytes(rec));
-            }
-            parsed += 1;
-            let Some(next) = pos.checked_add(size) else { break };
-            pos = next;
-        }
-        if parsed == 0 {
-            return Err(Error::NoRecords);
-        }
-        // Some dual files omit the EMF fallback. Replay once with fresh drawing state,
-        // accepting EMF+ only when EMF produced nothing and no resource limit stopped it.
-        if !allow_dual && plus.dual && cv.items.is_empty() && !cv.full() {
-            allow_dual = true;
-            continue;
-        }
-        return Ok((cv, frame));
+    let mut cv = Canvas::new();
+    if r > l && b > t {
+        cv.set_clip_surface([l, t, r, b]);
     }
+    if let Some(px_mm) = device_px_per_mm(input) {
+        cv.set_device_mm(px_mm);
+    }
+    let mut plus = crate::emfplus::Plus::new();
+    plus.frame = frame.as_ref().map(|f| f.rect);
+    let mut parsed = 0usize;
+    let mut pos = hsize.max(88);
+    while !cv.full() {
+        let (Some(typ), Some(size)) = (input.u32(pos), pos.checked_add(4).and_then(|o| input.u32(o))) else { break };
+        let size = size as usize;
+        if size < 8 || !size.is_multiple_of(4) {
+            break;
+        }
+        let Some(rec) = input.slice(pos, size) else { break };
+        if typ == 14 {
+            break;
+        }
+        if typ == 70 && Bytes(rec).u32(12) == Some(crate::emfplus::EMF_PLUS) {
+            if let Some(data) = Bytes(rec).tail(16) {
+                plus.comment(&mut cv, data);
+            }
+        } else if plus.plays_gdi() {
+            record(&mut cv, typ, Bytes(rec));
+        }
+        parsed += 1;
+        let Some(next) = pos.checked_add(size) else { break };
+        pos = next;
+    }
+    if parsed == 0 {
+        return Err(Error::NoRecords);
+    }
+    Ok((cv, frame))
 }
 
 /// Device pixels per millimetre on each axis, from `szlDevice` (72) and `szlMillimeters` (80).

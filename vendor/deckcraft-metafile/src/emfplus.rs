@@ -1,8 +1,8 @@
 //! EMF+ (MS-EMFPLUS): GDI+ drawing records carried in EMF comment records.
 //!
-//! Most EMF+ files are *dual*: the same picture is also drawn with plain EMF records, which
-//! [`crate::emf`] prefers. If those produce no drawing items, it replays the EMF+ part instead.
-//! An *EMF+ only* file plays these records directly:
+//! EMF+ Only and Dual files both play their EMF+ records. Ordinary EMF records form a fallback
+//! for GDI-only readers and are skipped here, except after EmfPlusGetDC until the next
+//! EMF+ record. This reader plays:
 //! - brushes (solid, hatch, texture, linear and path gradients), pens, paths, images, fonts,
 //!   string formats and regions, including objects split across several records;
 //! - rectangles, polygons, lines, ellipses, paths and Béziers;
@@ -214,10 +214,10 @@ struct Saved {
 }
 
 pub(crate) struct Plus {
-    /// A header enabled EMF+ playback, either directly or as a missing EMF fallback.
+    /// A header enabled EMF+ playback, for both EMF+ Only and Dual files.
     active: bool,
-    allow_dual: bool,
-    pub dual: bool,
+    /// GetDC enabled ordinary EMF playback until the next EMF+ record.
+    gdi: bool,
     dpi: f64,
     world: Xform,
     page: f64,
@@ -231,11 +231,10 @@ pub(crate) struct Plus {
 }
 
 impl Plus {
-    pub fn new(allow_dual: bool) -> Self {
+    pub fn new() -> Self {
         Plus {
             active: false,
-            allow_dual,
-            dual: false,
+            gdi: false,
             dpi: 96.0,
             world: IDENTITY,
             page: 1.0,
@@ -247,8 +246,14 @@ impl Plus {
         }
     }
 
+    /// Plain EMF files play normally; EMF+ files play EMF only inside a GetDC window.
+    pub fn plays_gdi(&self) -> bool {
+        !self.active || self.gdi
+    }
+
     /// Plays the EMF+ records of one EMR_COMMENT payload (after the identifier).
     pub fn comment(&mut self, cv: &mut Canvas, data: Bytes) {
+        self.gdi = false;
         let mut pos = 0usize;
         while !cv.full() {
             let (Some(typ), Some(flags), Some(size), Some(dsize)) = (data.u16(pos), data.u16(pos + 2), data.u32(pos + 4), data.u32(pos + 8)) else {
@@ -259,6 +264,8 @@ impl Plus {
                 break;
             }
             let Some(rec) = data.slice(pos + 12, dsize) else { break };
+            // Any EMF+ record closes the window; GetDC opens it again for its own.
+            self.gdi = false;
             let _ = self.record(cv, typ, flags, Bytes(rec));
             let Some(next) = pos.checked_add(size) else { break };
             pos = next;
@@ -276,9 +283,7 @@ impl Plus {
 
     fn record(&mut self, cv: &mut Canvas, typ: u16, flags: u16, r: Bytes) -> Option<()> {
         if typ == 0x4001 {
-            // Prefer EMF for dual files unless the caller found no EMF drawing items.
-            self.dual = flags & 1 != 0;
-            self.active = self.allow_dual || !self.dual;
+            self.active = true;
             if let Some(d) = r.u32(8).map(f64::from).filter(|d| *d > 0.0 && *d < 100_000.0) {
                 self.dpi = d;
             }
@@ -286,6 +291,10 @@ impl Plus {
         }
         if !self.active {
             return None;
+        }
+        if typ == 0x4004 {
+            self.gdi = true;
+            return Some(());
         }
         let compressed = flags & 0x4000 != 0;
         let id = usize::from(flags & 0xFF);
