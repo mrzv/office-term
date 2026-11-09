@@ -8,7 +8,7 @@ description = "A low-latency Office document viewer (PowerPoint, Word, Excel) fo
 license = "MIT"
 
 [workspace]
-members = ["vendor/deckcraft-fonts", "vendor/gridcraft-calc", "vendor/gridcraft-xlsx", "vendor/wordcraft-doc"]
+members = ["vendor/deckcraft-fonts", "vendor/deckcraft-metafile", "vendor/gridcraft-calc", "vendor/gridcraft-xlsx", "vendor/wordcraft-doc"]
 resolver = "3"
 
 [[bin]]
@@ -59,6 +59,7 @@ wordcraft-doc = { path = "vendor/wordcraft-doc" }
 
 [patch."https://github.com/storytold/deckcraft"]
 deckcraft-fonts = { path = "vendor/deckcraft-fonts" }
+deckcraft-metafile = { path = "vendor/deckcraft-metafile" }
 
 [patch."https://github.com/storytold/gridcraft"]
 gridcraft-xlsx = { path = "vendor/gridcraft-xlsx" }
